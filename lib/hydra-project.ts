@@ -210,7 +210,9 @@ export function resolveProject(options: ResolveProjectOptions = {}): ProjectConf
   }
 
   const projectName = detectProjectName(projectRoot);
-  const coordDir = path.join(projectRoot, 'docs', 'coordination');
+  const coordDir = path.join(projectRoot, '.hydra');
+
+  importLegacyCoordDirOnce(projectRoot, coordDir);
 
   return {
     projectRoot,
@@ -224,6 +226,48 @@ export function resolveProject(options: ResolveProjectOptions = {}): ProjectConf
     runsDir: path.join(coordDir, 'runs'),
     hydraRoot: HYDRA_ROOT,
   };
+}
+
+const LEGACY_COORD_FILES = [
+  'AI_SYNC_STATE.json',
+  'AI_SYNC_LOG.md',
+  'AI_ORCHESTRATOR_STATUS.json',
+  'AI_ORCHESTRATOR_EVENTS.ndjson',
+  'AI_SYNC_ARCHIVE.json',
+];
+const LEGACY_IMPORT_MARKER = '.legacy-import-done';
+
+/**
+ * One-time migration: if a project still has its old docs/coordination/
+ * state and hasn't been migrated yet, copy the known coord files into the
+ * new .hydra/ directory before anything reads/writes there. Never
+ * overwrites an existing .hydra/ file, and only ever runs once per project
+ * (tracked by a marker file) so a project that genuinely wants both
+ * directories (e.g. docs/coordination used by an unrelated tool) isn't
+ * repeatedly re-imported.
+ */
+function importLegacyCoordDirOnce(projectRoot: string, coordDir: string): void {
+  const markerPath = path.join(coordDir, LEGACY_IMPORT_MARKER);
+  if (fs.existsSync(markerPath)) return;
+
+  const legacyCoordDir = path.join(projectRoot, 'docs', 'coordination');
+  const legacyStatePath = path.join(legacyCoordDir, 'AI_SYNC_STATE.json');
+  if (!fs.existsSync(legacyStatePath)) return;
+
+  try {
+    fs.mkdirSync(coordDir, { recursive: true });
+    for (const file of LEGACY_COORD_FILES) {
+      const from = path.join(legacyCoordDir, file);
+      const to = path.join(coordDir, file);
+      if (fs.existsSync(from) && !fs.existsSync(to)) {
+        fs.copyFileSync(from, to);
+      }
+    }
+    fs.writeFileSync(markerPath, `${new Date().toISOString()}\n`, 'utf8');
+  } catch {
+    // Best-effort: if the import fails partway, don't write the marker so
+    // the next resolveProject() call can retry.
+  }
 }
 
 /**

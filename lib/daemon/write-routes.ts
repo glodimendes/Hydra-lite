@@ -19,6 +19,8 @@ import {
 } from './web-operations-controls.ts';
 import { loadHydraConfig as loadConfig } from '../hydra-config.ts';
 import type { ControlKind } from '@hydra/web-contracts';
+import { resolveTier, type TaskEffect, type TierOverride } from '../hydra-tier.ts';
+import { canClaim, countInFlight, type ProjectInFlight } from './scheduler.ts';
 
 // ── Mutation helpers ──────────────────────────────────────────────────────────
 
@@ -408,85 +410,165 @@ async function applyWorktreeMerge(
 
 // ── Mutation factories ────────────────────────────────────────────────────────
 
+/**
+ * Hydra Lite concurrency gate: throws if claiming a task with the given
+ * effect in `projectId` would exceed the global or per-project limit (see
+ * lib/daemon/scheduler.ts). Only called when `projectId` is set — legacy
+ * single-project callers (no registry project targeted) are unaffected, so
+ * the existing multi-agent/multi-task-per-project behavior keeps working.
+ * Reads every OTHER registered project's state synchronously (via
+ * `countOtherProjectsInFlight`) and combines it with this project's own
+ * `state.tasks` (already loaded by the caller) into one snapshot. This
+ * whole check runs synchronously inside the already-serialized per-project
+ * mutation, so two claims can never race past the limit within one daemon
+ * process — Node's single-threaded, run-to-completion execution model
+ * means no other mutation (for any project) can interleave mid-check.
+ */
+function assertWithinConcurrencyLimits(
+  state: HydraStateShape,
+  projectId: string,
+  effect: TaskEffect,
+  countOtherProjectsInFlight: () => Record<string, ProjectInFlight>,
+): void {
+  const snapshot: Record<string, ProjectInFlight> = {
+    ...countOtherProjectsInFlight(),
+    [projectId]: countInFlight(state.tasks),
+  };
+  if (!canClaim(snapshot, projectId, effect)) {
+    throw new Error(
+      `Concurrency limit reached: cannot start a new ${effect} task in this project right now.`,
+    );
+  }
+}
+
 /* eslint-disable complexity -- queued task mutations intentionally bundle related state updates atomically */
+/** Claim branch of mutateTaskClaim: an existing task, found by taskId. */
+function claimExistingTask(
+  state: HydraStateShape,
+  existing: TaskEntry,
+  agent: string,
+  body: Record<string, unknown>,
+  ctx: WriteRouteCtx,
+): TaskEntry {
+  const { parseList, nowIso, projectId, countOtherProjectsInFlight } = ctx;
+  const taskId = existing.id;
+  if (['done', 'cancelled'].includes(existing.status)) {
+    throw new Error(`Task ${taskId} is already ${existing.status}.`);
+  }
+  if (existing.status === 'awaiting_approval') {
+    throw new Error(`Task ${taskId} is awaiting approval and cannot be claimed yet.`);
+  }
+  if (existing.status === 'in_progress' && existing.owner !== agent) {
+    throw new Error(`Task ${taskId} is already in progress by ${existing.owner}.`);
+  }
+  if (projectId != null && existing.status !== 'in_progress') {
+    assertWithinConcurrencyLimits(
+      state,
+      projectId,
+      (existing.effect as TaskEffect | undefined) ?? 'read',
+      countOtherProjectsInFlight,
+    );
+  }
+
+  const files = parseList(body['files']);
+  const notes = ((body['notes'] as string | null | undefined) ?? '').trim();
+  const previousOwner = existing.owner;
+  const previousStatus = existing.status;
+  existing.owner = agent;
+  existing.status = 'in_progress';
+  (existing as Record<string, unknown>)['claimToken'] = crypto.randomUUID();
+  if (files.length > 0) existing.files = files;
+  if (notes !== '') {
+    existing.notes = existing.notes === '' ? notes : `${existing.notes}\n${notes}`;
+  }
+  const mode =
+    typeof body['mode'] === 'string' && body['mode'].trim() !== '' ? body['mode'].trim() : null;
+  appendRoutingHistory(
+    existing,
+    nowIso(),
+    agent,
+    mode,
+    previousOwner === agent ? 'Task claimed for execution' : `Task reassigned to ${agent}`,
+  );
+  closeLatestAssignment(
+    existing,
+    nowIso(),
+    ASSIGNMENT_STATE_BY_TASK_STATUS[previousStatus] ?? 'waiting',
+    {
+      forceEndedAt: true,
+    },
+  );
+  existing.updatedAt = nowIso();
+  existing.owner = agent;
+  existing.status = 'in_progress';
+  appendAssignmentHistory(existing, nowIso(), agent, 'active');
+  return existing;
+}
+
+/**
+ * Claim branch of mutateTaskClaim: no taskId, so a brand-new task is
+ * created and claimed in one step. Hydra Lite's edit-approval gate applies
+ * here too: without the effect check below, an edit-effect task would be
+ * born directly in_progress, bypassing approval entirely. Legacy callers
+ * never send `effect`, so this is a no-op for every pre-existing caller.
+ */
+function createTaskViaClaim(
+  state: HydraStateShape,
+  title: string,
+  agent: string,
+  body: Record<string, unknown>,
+  ctx: WriteRouteCtx,
+): TaskEntry {
+  const { parseList, nextId, nowIso, projectId, countOtherProjectsInFlight } = ctx;
+  const files = parseList(body['files']);
+  const notes = ((body['notes'] as string | null | undefined) ?? '').trim();
+  const claimBlockedBy = parseList(body['blockedBy'] ?? []);
+  const effectRaw = ((body['effect'] as string | null | undefined) ?? '').trim();
+  const effect: TaskEffect = effectRaw === 'edit' ? 'edit' : 'read';
+  if (effect === 'read' && projectId != null) {
+    assertWithinConcurrencyLimits(state, projectId, 'read', countOtherProjectsInFlight);
+  }
+  const newTask: TaskEntry = {
+    id: nextId('T', state.tasks),
+    title,
+    owner: agent,
+    status: effect === 'edit' ? 'awaiting_approval' : 'in_progress',
+    type: '',
+    claimToken: crypto.randomUUID(),
+    files,
+    notes,
+    blockedBy: claimBlockedBy,
+    updatedAt: nowIso(),
+  };
+  if (projectId != null) newTask.projectId = projectId;
+  if (effectRaw === 'edit' || effectRaw === 'read') {
+    newTask.effect = effect;
+    const tierOverride = ((body['tier'] as string | null | undefined) ?? 'auto') as TierOverride;
+    newTask.tier = resolveTier(effect, tierOverride);
+  }
+  if (effect === 'edit') {
+    newTask.approval = { status: 'pending', requestedAt: nowIso() };
+  }
+  annotateTaskHistory(newTask, body, 'Task created via claim', nowIso());
+  state.tasks.push(newTask);
+  return newTask;
+}
+
 function mutateTaskClaim(
   body: Record<string, unknown>,
   agent: string,
   ctx: WriteRouteCtx,
 ): (state: HydraStateShape) => TaskEntry {
-  const { parseList, nextId, nowIso } = ctx;
   return (state: HydraStateShape) => {
     const taskId = ((body['taskId'] as string | null | undefined) ?? '').trim();
     const title = ((body['title'] as string | null | undefined) ?? '').trim();
-    const files = parseList(body['files']);
-    const notes = ((body['notes'] as string | null | undefined) ?? '').trim();
     if (taskId !== '') {
       const existing = state.tasks.find((item: TaskEntry) => item.id === taskId);
       if (!existing) throw new Error(`Task ${taskId} not found.`);
-      if (['done', 'cancelled'].includes(existing.status)) {
-        throw new Error(`Task ${taskId} is already ${existing.status}.`);
-      }
-      if (existing.status === 'in_progress' && existing.owner !== agent) {
-        throw new Error(`Task ${taskId} is already in progress by ${existing.owner}.`);
-      }
-      const previousOwner = existing.owner;
-      const previousStatus = existing.status;
-      existing.owner = agent;
-      existing.status = 'in_progress';
-      (existing as Record<string, unknown>)['claimToken'] = crypto.randomUUID();
-      if (files.length > 0) existing.files = files;
-      if (notes !== '') {
-        existing.notes = existing.notes === '' ? notes : `${existing.notes}\n${notes}`;
-      }
-      const mode =
-        typeof body['mode'] === 'string' && body['mode'].trim() !== '' ? body['mode'].trim() : null;
-      appendRoutingHistory(
-        existing,
-        nowIso(),
-        agent,
-        mode,
-        previousOwner === agent ? 'Task claimed for execution' : `Task reassigned to ${agent}`,
-      );
-      if (previousOwner === agent) {
-        closeLatestAssignment(
-          existing,
-          nowIso(),
-          ASSIGNMENT_STATE_BY_TASK_STATUS[previousStatus] ?? 'waiting',
-          {
-            forceEndedAt: true,
-          },
-        );
-      } else {
-        closeLatestAssignment(
-          existing,
-          nowIso(),
-          ASSIGNMENT_STATE_BY_TASK_STATUS[previousStatus] ?? 'waiting',
-          { forceEndedAt: true },
-        );
-      }
-      existing.updatedAt = nowIso();
-      existing.owner = agent;
-      existing.status = 'in_progress';
-      appendAssignmentHistory(existing, nowIso(), agent, 'active');
-      return existing;
+      return claimExistingTask(state, existing, agent, body, ctx);
     }
     if (title === '') throw new Error('Either taskId or title is required.');
-    const claimBlockedBy = parseList(body['blockedBy'] ?? []);
-    const newTask: TaskEntry = {
-      id: nextId('T', state.tasks),
-      title,
-      owner: agent,
-      status: 'in_progress',
-      type: '',
-      claimToken: crypto.randomUUID(),
-      files,
-      notes,
-      blockedBy: claimBlockedBy,
-      updatedAt: nowIso(),
-    };
-    annotateTaskHistory(newTask, body, 'Task created via claim', nowIso());
-    state.tasks.push(newTask);
-    return newTask;
+    return createTaskViaClaim(state, title, agent, body, ctx);
   };
 }
 
@@ -548,6 +630,13 @@ function mutateTaskUpdate(
         existing.notes = existing.notes === '' ? notes : `${existing.notes}\n${notes}`;
       }
     }
+    // Hydra Lite edit-execution result fields (lib/hydra-lite-chat.ts's
+    // `/run`) — additive, optional, no effect on any pre-existing caller.
+    if (body['manifest'] !== undefined) existing.manifest = parseList(body['manifest']);
+    if (body['verification'] !== undefined) {
+      existing.verification = body['verification'] as TaskEntry['verification'];
+    }
+    if (body['commitSha'] !== undefined) existing.commitSha = body['commitSha'] as string;
     existing.updatedAt = nowIso();
     if ((existing as Record<string, unknown>)['stale'] === true) {
       (existing as Record<string, unknown>)['stale'] = false;
@@ -780,6 +869,72 @@ async function handleSessionResume(ctx: WriteRouteCtx): Promise<boolean> {
   return true;
 }
 
+/**
+ * Hydra Lite's edit-approval gate: an edit-effect task is ALWAYS created
+ * awaiting_approval, regardless of any client-supplied status — closing
+ * the loophole where a caller could otherwise request status:'todo'
+ * directly on an edit task. Legacy callers never send `effect`, so this is
+ * a no-op for every pre-existing caller (status falls through unchanged).
+ */
+function resolveTaskAddEffectAndStatus(body: Record<string, unknown>): {
+  effect: TaskEffect | undefined;
+  status: string;
+} {
+  const effectRaw = ((body['effect'] as string | null | undefined) ?? '').trim();
+  const effect: TaskEffect | undefined =
+    effectRaw === 'edit' || effectRaw === 'read' ? (effectRaw as TaskEffect) : undefined;
+  const status =
+    effect === 'edit'
+      ? 'awaiting_approval'
+      : ((body['status'] as string | null | undefined) ?? 'todo');
+  return { effect, status };
+}
+
+function stampHydraLiteTaskFields(
+  item: Record<string, unknown>,
+  projectId: string | undefined,
+  effect: TaskEffect | undefined,
+  body: Record<string, unknown>,
+  nowIso: () => string,
+): void {
+  if (projectId != null) item['projectId'] = projectId;
+  if (effect == null) return;
+  item['effect'] = effect;
+  const tierOverride = ((body['tier'] as string | null | undefined) ?? 'auto') as TierOverride;
+  item['tier'] = resolveTier(effect, tierOverride);
+  if (effect === 'edit') {
+    item['approval'] = { status: 'pending', requestedAt: nowIso() };
+  }
+}
+
+async function maybeCreateTaskAddWorktree(
+  ctx: WriteRouteCtx,
+  task: Record<string, unknown>,
+  wantWorktree: boolean,
+): Promise<Record<string, unknown> | null> {
+  const { enqueueMutation, projectRoot } = ctx;
+  const taskId = task['id'] as string | undefined;
+  if (!wantWorktree || taskId == null) return null;
+  try {
+    const worktreeInfo = createWorktree(taskId, projectRoot as string) as Record<string, unknown>;
+    await enqueueMutation(
+      `task:worktree id=${taskId}`,
+      (state: HydraStateShape) => {
+        const t = state.tasks.find((x: TaskEntry) => x.id === taskId);
+        if (t) {
+          t.worktreePath = worktreeInfo['worktreePath'] as string;
+          t.worktreeBranch = worktreeInfo['branch'] as string;
+        }
+      },
+      { event: 'worktree_create', taskId },
+    );
+    return worktreeInfo;
+  } catch {
+    /* non-critical */
+    return null;
+  }
+}
+
 async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
   const {
     req,
@@ -793,7 +948,7 @@ async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
     classifyTask,
     nextId,
     nowIso,
-    projectRoot,
+    projectId,
   } = ctx;
   const body = await ctx.readJsonBody(req);
   const title = ((body['title'] as string | null | undefined) ?? '').trim();
@@ -803,7 +958,7 @@ async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
   }
   const owner = ((body['owner'] as string | null | undefined) ?? 'unassigned').toLowerCase();
   ensureKnownAgent(owner);
-  const status = (body['status'] as string | null | undefined) ?? 'todo';
+  const { effect, status } = resolveTaskAddEffectAndStatus(body);
   ensureKnownStatus(status);
   const files = parseList(body['files'] ?? []);
   const notes = ((body['notes'] as string | null | undefined) ?? '').trim();
@@ -814,7 +969,7 @@ async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
   const task = await enqueueMutation(
     `task:add owner=${owner} status=${status} type=${taskType}`,
     (state: HydraStateShape) => {
-      const item = {
+      const item: Record<string, unknown> = {
         id: nextId('T', state.tasks),
         title,
         owner,
@@ -825,36 +980,14 @@ async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
         blockedBy,
         updatedAt: nowIso(),
       };
+      stampHydraLiteTaskFields(item, projectId, effect, body, nowIso);
       annotateTaskHistory(item as TaskEntry, body, 'Task created', nowIso());
       state.tasks.push(item as unknown as TaskEntry);
       return item;
     },
     { event: 'task_add', owner, title: title.slice(0, 80) },
   );
-  let worktreeInfo: Record<string, unknown> | null = null;
-  if (wantWorktree && (task as Record<string, unknown>)['id'] != null) {
-    try {
-      worktreeInfo = createWorktree(
-        (task as Record<string, unknown>)['id'] as string,
-        projectRoot as string,
-      ) as Record<string, unknown>;
-      await enqueueMutation(
-        `task:worktree id=${(task as Record<string, unknown>)['id'] as string}`,
-        (state: HydraStateShape) => {
-          const t = state.tasks.find(
-            (x: TaskEntry) => x.id === ((task as Record<string, unknown>)['id'] as string),
-          );
-          if (t && worktreeInfo != null) {
-            t.worktreePath = worktreeInfo['worktreePath'] as string;
-            t.worktreeBranch = worktreeInfo['branch'] as string;
-          }
-        },
-        { event: 'worktree_create', taskId: (task as Record<string, unknown>)['id'] as string },
-      );
-    } catch {
-      /* non-critical */
-    }
-  }
+  const worktreeInfo = await maybeCreateTaskAddWorktree(ctx, task, wantWorktree);
   sendJson(res, 200, { ok: true, task, worktree: worktreeInfo });
   return true;
 }
@@ -919,6 +1052,55 @@ async function handleTaskClaim(ctx: WriteRouteCtx): Promise<boolean> {
     /* hub sync is non-critical */
   }
   sendJson(res, 200, { ok: true, task });
+  return true;
+}
+
+/**
+ * The only path allowed to flip a task from `awaiting_approval` to `todo`
+ * (Hydra Lite's edit-approval gate). Guarded by checking the task's current
+ * status is exactly `awaiting_approval` — rejects otherwise, e.g. a task
+ * that was never gated, or one already approved. Approving does not itself
+ * invoke Codex: it just re-enters the normal claim/execute loop via the
+ * existing-task branch of mutateTaskClaim.
+ */
+async function handleTaskApprove(ctx: WriteRouteCtx): Promise<boolean> {
+  const { req, res, sendJson, sendError, enqueueMutation, nowIso } = ctx;
+  const body = await ctx.readJsonBody(req);
+  const taskId = ((body['taskId'] as string | null | undefined) ?? '').trim();
+  if (taskId === '') {
+    sendError(res, 400, 'Field "taskId" is required.');
+    return true;
+  }
+  const approvedBy = ((body['approvedBy'] as string | null | undefined) ?? 'human').trim();
+  try {
+    const task = await enqueueMutation(
+      `task:approve id=${taskId}`,
+      (state: HydraStateShape) => {
+        const existing = state.tasks.find((item: TaskEntry) => item.id === taskId);
+        if (!existing) throw new Error(`Task ${taskId} not found.`);
+        if (existing.status !== 'awaiting_approval') {
+          throw new Error(`Task ${taskId} is not awaiting approval (status: ${existing.status}).`);
+        }
+        existing.status = 'todo';
+        existing.approval = {
+          status: 'approved',
+          requestedAt: existing.approval?.requestedAt ?? nowIso(),
+          approvedAt: nowIso(),
+          approvedBy,
+        };
+        existing.updatedAt = nowIso();
+        return existing;
+      },
+      { event: 'task_approve', taskId },
+    );
+    sendJson(res, 200, { ok: true, task });
+  } catch (err) {
+    sendError(
+      res,
+      400,
+      (err as Error).message === '' ? 'Approval failed.' : (err as Error).message,
+    );
+  }
   return true;
 }
 
@@ -1598,6 +1780,7 @@ const POST_ROUTES: Partial<Record<string, (ctx: WriteRouteCtx) => Promise<boolea
   '/session/resume': handleSessionResume,
   '/task/add': handleTaskAdd,
   '/task/claim': handleTaskClaim,
+  '/task/approve': handleTaskApprove,
   '/task/update': handleTaskUpdate,
   '/task/route': handleTaskRoute,
   '/verify': handleVerify,

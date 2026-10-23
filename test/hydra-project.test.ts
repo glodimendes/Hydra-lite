@@ -211,7 +211,7 @@ describe('addRecentProject', () => {
 // ── resolveProject ───────────────────────────────────────────────────────────
 
 describe('resolveProject', () => {
-  it('returns a ProjectConfig with all expected path fields', () => {
+  it('returns a ProjectConfig with all expected path fields under .hydra/', () => {
     const dir = makeTempDir();
     fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'test-app' }), 'utf8');
 
@@ -219,22 +219,13 @@ describe('resolveProject', () => {
 
     assert.equal(project.projectRoot, dir);
     assert.equal(project.projectName, 'test-app');
-    assert.equal(project.coordDir, path.join(dir, 'docs', 'coordination'));
-    assert.equal(project.statePath, path.join(dir, 'docs', 'coordination', 'AI_SYNC_STATE.json'));
-    assert.equal(project.logPath, path.join(dir, 'docs', 'coordination', 'AI_SYNC_LOG.md'));
-    assert.equal(
-      project.statusPath,
-      path.join(dir, 'docs', 'coordination', 'AI_ORCHESTRATOR_STATUS.json'),
-    );
-    assert.equal(
-      project.eventsPath,
-      path.join(dir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson'),
-    );
-    assert.equal(
-      project.archivePath,
-      path.join(dir, 'docs', 'coordination', 'AI_SYNC_ARCHIVE.json'),
-    );
-    assert.equal(project.runsDir, path.join(dir, 'docs', 'coordination', 'runs'));
+    assert.equal(project.coordDir, path.join(dir, '.hydra'));
+    assert.equal(project.statePath, path.join(dir, '.hydra', 'AI_SYNC_STATE.json'));
+    assert.equal(project.logPath, path.join(dir, '.hydra', 'AI_SYNC_LOG.md'));
+    assert.equal(project.statusPath, path.join(dir, '.hydra', 'AI_ORCHESTRATOR_STATUS.json'));
+    assert.equal(project.eventsPath, path.join(dir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson'));
+    assert.equal(project.archivePath, path.join(dir, '.hydra', 'AI_SYNC_ARCHIVE.json'));
+    assert.equal(project.runsDir, path.join(dir, '.hydra', 'runs'));
     assert.ok(project.hydraRoot.length > 0);
   });
 
@@ -268,5 +259,62 @@ describe('resolveProject', () => {
     const project = resolveProject({ project: dir });
 
     assert.ok(path.isAbsolute(project.projectRoot));
+  });
+});
+
+// ── Legacy docs/coordination/ -> .hydra/ one-time import ───────────────────
+
+describe('resolveProject legacy import', () => {
+  it('copies known coord files from docs/coordination/ into .hydra/ once', () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}', 'utf8');
+    const legacyCoordDir = path.join(dir, 'docs', 'coordination');
+    fs.mkdirSync(legacyCoordDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(legacyCoordDir, 'AI_SYNC_STATE.json'),
+      JSON.stringify({ schemaVersion: 1, tasks: [{ id: 'T001' }] }),
+      'utf8',
+    );
+    fs.writeFileSync(path.join(legacyCoordDir, 'AI_SYNC_LOG.md'), '# legacy log\n', 'utf8');
+
+    const project = resolveProject({ project: dir });
+
+    const migratedState = JSON.parse(fs.readFileSync(project.statePath, 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    assert.deepEqual(migratedState['tasks'], [{ id: 'T001' }]);
+    assert.equal(
+      fs.readFileSync(path.join(project.coordDir, 'AI_SYNC_LOG.md'), 'utf8'),
+      '# legacy log\n',
+    );
+  });
+
+  it('does not overwrite an already-migrated .hydra/ state file on a later call', () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}', 'utf8');
+    const legacyCoordDir = path.join(dir, 'docs', 'coordination');
+    fs.mkdirSync(legacyCoordDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(legacyCoordDir, 'AI_SYNC_STATE.json'),
+      JSON.stringify({ tasks: [{ id: 'LEGACY' }] }),
+      'utf8',
+    );
+
+    const first = resolveProject({ project: dir });
+    fs.writeFileSync(first.statePath, JSON.stringify({ tasks: [{ id: 'NEWER' }] }), 'utf8');
+
+    const second = resolveProject({ project: dir });
+    const state = JSON.parse(fs.readFileSync(second.statePath, 'utf8')) as Record<string, unknown>;
+    assert.deepEqual(state['tasks'], [{ id: 'NEWER' }]);
+  });
+
+  it('does nothing when there is no legacy docs/coordination/ state', () => {
+    const dir = makeTempDir();
+    fs.writeFileSync(path.join(dir, 'package.json'), '{}', 'utf8');
+
+    const project = resolveProject({ project: dir });
+
+    assert.equal(fs.existsSync(project.coordDir), false);
   });
 });

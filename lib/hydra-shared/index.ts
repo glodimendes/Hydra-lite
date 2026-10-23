@@ -5,6 +5,7 @@
 export * from './git-ops.ts';
 export * from './constants.ts';
 export * from './guardrails.ts';
+export * from './atomic-write.ts';
 export { BudgetTracker } from './budget-tracker.ts';
 export type {
   Threshold,

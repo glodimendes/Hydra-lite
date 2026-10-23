@@ -185,6 +185,7 @@ function makeWriteCtx(
     mergeTaskWorktree: () => ({}),
     cleanupTaskWorktree: () => {},
     writeStatus: () => {},
+    countOtherProjectsInFlight: () => ({}),
     _appendedEvents: appendedEvents,
     _broadcastedEvents: broadcastedEvents,
   } as WriteRouteCtx & {

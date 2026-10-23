@@ -9,6 +9,7 @@ import {
   sectionHeader,
   type TaskLike,
 } from './hydra-ui.ts';
+import { HYDRA_LITE_COMMANDS } from './hydra-command-registry.ts';
 
 type AgentNextAction = {
   action?: string;
@@ -320,6 +321,20 @@ function printGithubAndForgeHelp(): void {
   console.log('');
 }
 
+/**
+ * Printed from the single HYDRA_LITE_COMMANDS registry
+ * (lib/hydra-command-registry.ts), so this block's text can never drift
+ * from what COMMAND_TABLE actually dispatches — the thing the plan calls
+ * out as currently drifted for the hand-written blocks around it.
+ */
+function printHydraLiteHelp(): void {
+  console.log(pc.bold('Hydra Lite:'));
+  for (const entry of HYDRA_LITE_COMMANDS) {
+    console.log(`  ${ACCENT(entry.usage)}  ${entry.desc}`);
+  }
+  console.log('');
+}
+
 function printAgentsAndSystemHelp(): void {
   console.log(pc.bold('Agents & diagnostics:'));
   console.log(`  ${ACCENT(':agents')}               List all registered agents`);
@@ -365,6 +380,7 @@ export function printHelp(): void {
   printEvolveAndNightlyHelp();
   printGithubAndForgeHelp();
   printAgentsAndSystemHelp();
+  printHydraLiteHelp();
 }
 
 export const KNOWN_COMMANDS = [
@@ -409,6 +425,7 @@ export const KNOWN_COMMANDS = [
   ':quit',
   ':exit',
   ':sync',
+  ...HYDRA_LITE_COMMANDS.map((entry) => entry.name),
 ];
 
 export const COMMAND_HELP: Partial<Record<string, CommandHelpEntry>> = {
@@ -580,6 +597,9 @@ export const COMMAND_HELP: Partial<Record<string, CommandHelpEntry>> = {
   ':shutdown': { usage: [':shutdown'], desc: 'Stop the daemon' },
   ':quit': { usage: [':quit'], desc: 'Exit operator console (alias: :exit)' },
   ':exit': { usage: [':exit'], desc: 'Exit operator console (alias: :quit)' },
+  ...Object.fromEntries(
+    HYDRA_LITE_COMMANDS.map((entry) => [entry.name, { usage: [entry.usage], desc: entry.desc }]),
+  ),
 };
 
 export function printCommandHelp(cmd: string): void {

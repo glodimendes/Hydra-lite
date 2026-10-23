@@ -74,7 +74,7 @@ describe('daemon/archive unit tests', () => {
   });
 
   beforeEach(() => {
-    const coordDir = path.join(tmpDir, 'docs', 'coordination');
+    const coordDir = path.join(tmpDir, '.hydra');
     if (fs.existsSync(coordDir)) {
       fs.rmSync(coordDir, { recursive: true, force: true });
     }
@@ -108,7 +108,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('returns parsed events from NDJSON file', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       const events: EventRecord[] = [
         { seq: 1, at: '2024-01-01T00:00:00Z', type: 'test' },
         { seq: 2, at: '2024-01-01T00:01:00Z', type: 'test2' },
@@ -122,7 +122,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('limits results to the requested count (last N lines)', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       const events: EventRecord[] = Array.from({ length: 20 }, (_, i) => ({
         seq: i + 1,
         at: '2024-01-01T00:00:00Z',
@@ -136,7 +136,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('skips malformed lines without throwing', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       fs.writeFileSync(
         eventsPath,
         `not-json\n{"seq":1,"at":"2024-01-01T00:00:00Z","type":"ok"}\nbroken\n`,
@@ -149,7 +149,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('clamps limit to max of 500', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       const events: EventRecord[] = Array.from({ length: 600 }, (_, i) => ({
         seq: i + 1,
         at: '2024-01-01T00:00:00Z',
@@ -171,7 +171,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('returns parsed archive from file', () => {
-      const archivePath = path.join(tmpDir, 'docs', 'coordination', 'AI_SYNC_ARCHIVE.json');
+      const archivePath = path.join(tmpDir, '.hydra', 'AI_SYNC_ARCHIVE.json');
       const archive: ArchiveState = {
         tasks: [{ id: 't1', status: 'done' } as unknown as TaskEntry],
         handoffs: [],
@@ -186,7 +186,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('returns empty archive when file is malformed JSON', () => {
-      const archivePath = path.join(tmpDir, 'docs', 'coordination', 'AI_SYNC_ARCHIVE.json');
+      const archivePath = path.join(tmpDir, '.hydra', 'AI_SYNC_ARCHIVE.json');
       fs.writeFileSync(archivePath, 'not-json', 'utf8');
 
       const result = mod.readArchive();
@@ -199,7 +199,7 @@ describe('daemon/archive unit tests', () => {
       const archive: ArchiveState = { tasks: [], handoffs: [], blockers: [] };
       mod.writeArchive(archive);
 
-      const archivePath = path.join(tmpDir, 'docs', 'coordination', 'AI_SYNC_ARCHIVE.json');
+      const archivePath = path.join(tmpDir, '.hydra', 'AI_SYNC_ARCHIVE.json');
       assert.ok(fs.existsSync(archivePath));
       const written = JSON.parse(fs.readFileSync(archivePath, 'utf8')) as ArchiveState;
       assert.ok(typeof written.archivedAt === 'string' && written.archivedAt.length > 0);
@@ -335,7 +335,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('returns 0 when file has fewer lines than maxLines', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       writeEvents(eventsPath, [
         { seq: 1, at: '2024-01-01T00:00:00Z', type: 'test' },
         { seq: 2, at: '2024-01-01T00:00:00Z', type: 'test' },
@@ -346,7 +346,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('truncates file to last maxLines lines and returns removed count', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       const events: EventRecord[] = Array.from({ length: 20 }, (_, i) => ({
         seq: i + 1,
         at: '2024-01-01T00:00:00Z',
@@ -368,23 +368,23 @@ describe('daemon/archive unit tests', () => {
 
   describe('createSnapshot', () => {
     it('creates a snapshot file and returns ok:true with filename', () => {
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       fs.writeFileSync(eventsPath, '', 'utf8');
 
       const result = mod.createSnapshot();
       assert.ok(result.ok, `Expected ok:true, got: ${result.error ?? 'unknown'}`);
       assert.ok(typeof result.filename === 'string' && result.filename.startsWith('snapshot_'));
 
-      const snapshotDir = path.join(tmpDir, 'docs', 'coordination', 'snapshots');
+      const snapshotDir = path.join(tmpDir, '.hydra', 'snapshots');
       assert.ok(fs.existsSync(path.join(snapshotDir, result.filename ?? '')));
     });
 
     it('creates snapshot dir if it does not exist', () => {
-      const snapshotDir = path.join(tmpDir, 'docs', 'coordination', 'snapshots');
+      const snapshotDir = path.join(tmpDir, '.hydra', 'snapshots');
       if (fs.existsSync(snapshotDir)) {
         fs.rmSync(snapshotDir, { recursive: true });
       }
-      const eventsPath = path.join(tmpDir, 'docs', 'coordination', 'AI_ORCHESTRATOR_EVENTS.ndjson');
+      const eventsPath = path.join(tmpDir, '.hydra', 'AI_ORCHESTRATOR_EVENTS.ndjson');
       fs.writeFileSync(eventsPath, '', 'utf8');
 
       const result = mod.createSnapshot();
@@ -402,7 +402,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('deletes oldest snapshots beyond retention count', () => {
-      const snapshotDir = path.join(tmpDir, 'docs', 'coordination', 'snapshots');
+      const snapshotDir = path.join(tmpDir, '.hydra', 'snapshots');
       fs.mkdirSync(snapshotDir, { recursive: true });
       for (let i = 0; i < 8; i++) {
         fs.writeFileSync(
@@ -420,7 +420,7 @@ describe('daemon/archive unit tests', () => {
     });
 
     it('does not delete if count is at or below retention', () => {
-      const snapshotDir = path.join(tmpDir, 'docs', 'coordination', 'snapshots');
+      const snapshotDir = path.join(tmpDir, '.hydra', 'snapshots');
       fs.mkdirSync(snapshotDir, { recursive: true });
       for (let i = 0; i < 3; i++) {
         fs.writeFileSync(

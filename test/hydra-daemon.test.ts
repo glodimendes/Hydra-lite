@@ -48,7 +48,7 @@ function createTempProject(packageJson: Record<string, unknown>): string {
 }
 
 function getCoordinationPaths(projectRoot: string) {
-  const coordDir = path.join(projectRoot, 'docs', 'coordination');
+  const coordDir = path.join(projectRoot, '.hydra');
   return {
     coordDir,
     statePath: path.join(coordDir, 'AI_SYNC_STATE.json'),

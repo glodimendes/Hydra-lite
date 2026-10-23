@@ -121,7 +121,7 @@ describe('hydra-config core behavior', () => {
 
     assert.equal(project.projectRoot, projectRoot);
     assert.equal(project.projectName, 'hydra-config-fixture');
-    assert.equal(project.coordDir, path.join(projectRoot, 'docs', 'coordination'));
+    assert.equal(project.coordDir, path.join(projectRoot, '.hydra'));
     assert.equal(project.runsDir, path.join(project.coordDir, 'runs'));
     assert.ok(project.hydraRoot.length > 0);
   });

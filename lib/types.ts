@@ -160,11 +160,56 @@ export type TaskType =
   | 'documentation'
   | 'security';
 
-/** Task lifecycle status values from STATUS_VALUES in orchestrator-daemon.mjs */
-export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'failed' | 'cancelled';
+/**
+ * Task lifecycle status values from STATUS_VALUES in orchestrator-daemon.mjs.
+ * `awaiting_approval` is Hydra Lite's edit-approval gate (see HYDRA_LITE_TASK_FIELDS
+ * below): an edit-effect task is created directly in this status and is never
+ * claimable until explicitly approved, so Codex is never invoked for it.
+ */
+export type TaskStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'blocked'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  | 'awaiting_approval';
+
+/** Hydra Lite's approval record for an edit-effect task. */
+export interface TaskApproval {
+  status: 'pending' | 'approved';
+  requestedAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+}
+
+/**
+ * Hydra Lite-specific fields layered onto a task. All optional at the type
+ * level so existing single-project literals/fixtures remain valid; the
+ * daemon's Hydra Lite code paths (registry-scoped `/task/add`, `/task/claim`,
+ * `/task/approve`) populate `projectId`/`effect` on every task they create.
+ * `manifest`/`verification`/`commitSha` are reserved for the later
+ * edit-execution milestone and are not populated or consumed yet.
+ */
+export interface HydraLiteTaskFields {
+  /** Immutable id of the Hydra Lite registry project this task belongs to. */
+  projectId?: string;
+  /** Whether Codex may only read (`-s read-only`) or may edit the project. */
+  effect?: 'read' | 'edit';
+  /** Deterministic Codex routing tier; edit tasks floor at 'balanced'. */
+  tier?: 'low' | 'balanced' | 'high';
+  approval?: TaskApproval;
+  verification?: { passed: boolean; command?: string; checkedAt: string };
+  /** Changed-file manifest staged by the (future) scoped commit step. */
+  manifest?: string[];
+  /** Incremented each time a crash/restart requeues this task. */
+  attempts?: number;
+  /** Local commit SHA produced by the (future) verify+commit step. */
+  commitSha?: string;
+}
 
 /** Shape of a task record as stored in daemon state.tasks[] */
-export interface TaskState {
+export interface TaskState extends HydraLiteTaskFields {
   id: string;
   title: string;
   owner: string;
@@ -805,6 +850,13 @@ export interface ReadRouteCtx {
   readArchive: () => ArchiveState;
   getMetricsSummary: () => Record<string, unknown>;
   getEventCount: () => number;
+  /**
+   * Hydra Lite registry project this request targets, resolved from the
+   * `?projectId=` query param. Undefined means "legacy single-project
+   * mode" (no behavior change from before the registry existed) — the
+   * daemon only applies registry-aware scoping/limits when this is set.
+   */
+  projectId?: string;
 }
 
 /** Context object passed to handleWriteRoute */
@@ -843,6 +895,14 @@ export interface WriteRouteCtx extends ReadRouteCtx {
   mergeTaskWorktree: (taskId: string) => Record<string, unknown>;
   cleanupTaskWorktree: (taskId: string) => void;
   writeStatus: (extra?: Record<string, unknown>) => void;
+  /**
+   * In-flight read/write load for every OTHER registered Hydra Lite
+   * project (excludes `projectId` itself) — used by the task/claim
+   * concurrency gate (lib/daemon/scheduler.ts's canClaim) to compute a
+   * global snapshot alongside the current project's own `state.tasks`.
+   * Only meaningful when `projectId` is set.
+   */
+  countOtherProjectsInFlight: () => Record<string, { reading: number; writing: boolean }>;
 }
 
 // ── Dispatch types ────────────────────────────────────────────────────────────

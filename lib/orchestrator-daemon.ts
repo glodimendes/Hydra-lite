@@ -43,6 +43,7 @@ import {
 } from './daemon/task-helpers.ts';
 import { hydraSplash, label as uiLabel, divider, SUCCESS, DIM } from './hydra-ui.ts';
 import { resolveProject, loadHydraConfig } from './hydra-config.ts';
+import type { ProjectConfig } from './hydra-config.ts';
 import {
   readEvents,
   readArchive,
@@ -69,13 +70,19 @@ import {
   nowIso,
   toSessionId,
   getEventSeq,
+  resetEventSeq,
+  initEventSeq,
   ensureCoordFiles,
   readState,
   writeState,
   appendSyncLog,
   appendEvent,
   replayEvents,
+  createProjectState,
+  type ProjectStateApi,
 } from './daemon/state.ts';
+import { listProjects, findProject } from './hydra-registry.ts';
+import { countInFlight, type ProjectInFlight } from './daemon/scheduler.ts';
 import type { ServerResponse, IncomingMessage } from 'node:http';
 import type {
   HydraStateShape,
@@ -99,8 +106,99 @@ const DEFAULT_HOST = process.env['AI_ORCH_HOST'] ?? '127.0.0.1';
 const DEFAULT_PORT = Number.parseInt(process.env['AI_ORCH_PORT'] ?? '4173', 10);
 const ORCH_TOKEN = process.env['AI_ORCH_TOKEN'] ?? '';
 
-function getCurrentBranch() {
-  return _getCurrentBranch(config.projectRoot);
+// ── Hydra Lite multi-project runtime ────────────────────────────────────────
+// A daemon started the legacy way (`project=<path>` CLI arg, or cwd) serves
+// exactly the one project resolved above — zero behavior change for every
+// pre-existing caller/test, since none of them ever send `?projectId=`.
+// When a request DOES carry `?projectId=<id>`, the daemon resolves it
+// against the Hydra Lite registry (lib/hydra-registry.ts) and serves that
+// project's own `.hydra/` state instead, via `createProjectState()`
+// (lib/daemon/state.ts) — so one daemon process can serve many registered
+// projects, each with its own isolated state file and event-sequence
+// counter, while every project's own mutations stay strictly ordered
+// (its own `writeQueue`, cached for the life of the process in
+// `ctx.projects`).
+
+const LEGACY_PROJECT_KEY = '__legacy__';
+
+interface ProjectRuntime {
+  config: ProjectConfig;
+  stateApi: ProjectStateApi;
+  writeQueue: Promise<unknown>;
+}
+
+const legacyRuntime: ProjectRuntime = {
+  config,
+  stateApi: {
+    ensureCoordFiles,
+    readState,
+    writeState,
+    appendSyncLog,
+    getEventSeq,
+    resetEventSeq,
+    initEventSeq,
+    appendEvent,
+    replayEvents,
+  },
+  writeQueue: Promise.resolve(),
+};
+
+function resolveRuntime(ctx: DaemonContext, projectId: string | undefined): ProjectRuntime {
+  const key = projectId ?? LEGACY_PROJECT_KEY;
+  const existing = ctx.projects.get(key);
+  if (existing) return existing;
+
+  const entry = findProject(key);
+  if (!entry) {
+    throw new Error(`No registered Hydra Lite project with id: ${key}`);
+  }
+  const projectConfig = resolveProject({ project: entry.path });
+  const runtime: ProjectRuntime = {
+    config: projectConfig,
+    stateApi: createProjectState({
+      coordDir: projectConfig.coordDir,
+      statePath: projectConfig.statePath,
+      logPath: projectConfig.logPath,
+      eventsPath: projectConfig.eventsPath,
+      projectName: projectConfig.projectName,
+    }),
+    writeQueue: Promise.resolve(),
+  };
+  ctx.projects.set(key, runtime);
+  return runtime;
+}
+
+/**
+ * In-flight read/write load for every registered Hydra Lite project OTHER
+ * than `excludeProjectId`, read fresh from each project's persisted
+ * `.hydra/state.json` (not from `ctx.projects`' cached runtimes, since this
+ * is read-only and needs no write-queue continuity). Used by the
+ * task/claim concurrency gate (lib/daemon/scheduler.ts's canClaim) to build
+ * a global snapshot alongside the current project's own `state.tasks`.
+ */
+function countOtherProjectsInFlight(
+  excludeProjectId: string | undefined,
+): Record<string, ProjectInFlight> {
+  const result: Record<string, ProjectInFlight> = {};
+  for (const project of listProjects()) {
+    if (project.id === excludeProjectId) continue;
+    try {
+      const projectConfig = resolveProject({ project: project.path, skipValidation: true });
+      const state = createProjectState({
+        coordDir: projectConfig.coordDir,
+        statePath: projectConfig.statePath,
+        logPath: projectConfig.logPath,
+        eventsPath: projectConfig.eventsPath,
+        projectName: projectConfig.projectName,
+      }).readState();
+      result[project.id] = countInFlight(state.tasks);
+    } catch {
+      // Unreadable/missing project state — treat as idle rather than
+      // failing an unrelated project's claim over it.
+      result[project.id] = { reading: 0, writing: false };
+    }
+  }
+  return result;
 }
 
 function buildPrompt(agent: string, state: HydraStateShape) {
@@ -131,11 +229,15 @@ interface DaemonContext {
   startedAt: string;
   lastEventAt: string;
   eventCount: number;
-  writeQueue: Promise<unknown>;
   sseClients: Set<ServerResponse>;
   conversationStore: ConversationStore;
   streamManager: StreamManager;
   eventBridge: EventBridge;
+  /** Resolved Hydra Lite project runtimes, keyed by registry id (or
+   * LEGACY_PROJECT_KEY for the daemon's own startup project), cached for
+   * the life of the process so each project's writeQueue stays continuous
+   * across requests. */
+  projects: Map<string, ProjectRuntime>;
 }
 
 interface DaemonIntervals {
@@ -151,6 +253,8 @@ type VerificationCallback = (error: Error | null, stdout: string, stderr: string
 function createDaemonContext(host: string, port: number): DaemonContext {
   const conversationStore = new ConversationStore();
   const eventBridge = new EventBridge();
+  const projects = new Map<string, ProjectRuntime>();
+  projects.set(LEGACY_PROJECT_KEY, legacyRuntime);
   return {
     host,
     port,
@@ -158,11 +262,11 @@ function createDaemonContext(host: string, port: number): DaemonContext {
     startedAt: nowIso(),
     lastEventAt: nowIso(),
     eventCount: 0,
-    writeQueue: Promise.resolve(),
     sseClients: new Set<ServerResponse>(),
     conversationStore,
     streamManager: new StreamManager(conversationStore, undefined, eventBridge),
     eventBridge,
+    projects,
   };
 }
 
@@ -239,24 +343,25 @@ function writeStatus(ctx: DaemonContext, extra: Record<string, unknown> = {}) {
 
 function enqueueMutation<T>(
   ctx: DaemonContext,
+  runtime: ProjectRuntime,
   label: string,
   mutator: (state: HydraStateShape) => T,
   detail: Record<string, unknown> = {},
 ) {
-  const mutation = ctx.writeQueue.then(() => {
-    const state = readState();
+  const mutation = runtime.writeQueue.then(() => {
+    const state = runtime.stateApi.readState();
     const result = mutator(state);
-    writeState(state);
-    appendSyncLog(`[orch] ${label}`);
+    runtime.stateApi.writeState(state);
+    runtime.stateApi.appendSyncLog(`[orch] ${label}`);
     const at = nowIso();
     const event = {
       id: `${String(Date.now())}_${Math.random().toString(36).slice(2, 8)}`,
-      seq: getEventSeq() + 1,
+      seq: runtime.stateApi.getEventSeq() + 1,
       at,
       type: 'mutation',
       payload: { label, ...detail },
     };
-    appendEvent('mutation', { label, ...detail }, event.id);
+    runtime.stateApi.appendEvent('mutation', { label, ...detail }, event.id);
     broadcastEvent(ctx.sseClients, event);
     ctx.lastEventAt = at;
     ctx.eventCount += 1;
@@ -264,7 +369,7 @@ function enqueueMutation<T>(
     return result;
   });
   // Prevent queue poisoning: failed mutations must not block subsequent ones
-  ctx.writeQueue = mutation.catch(() => {});
+  runtime.writeQueue = mutation.catch(() => {});
   return mutation;
 }
 
@@ -281,6 +386,7 @@ function handleVerificationResult(
     const snippetSliced = snippet.slice(0, 500);
     void enqueueMutation(
       ctx,
+      legacyRuntime,
       `verify:fail id=${taskId}`,
       (state: HydraStateShape) => {
         const task = state.tasks.find((t: TaskEntry) => t.id === taskId);
@@ -304,6 +410,7 @@ function handleVerificationResult(
 
   void enqueueMutation(
     ctx,
+    legacyRuntime,
     `verify:pass id=${taskId}`,
     (state) => {
       const task = state.tasks.find((t) => t.id === taskId);
@@ -489,12 +596,25 @@ function runVerification(ctx: DaemonContext, taskId: string, plan: Record<string
   runVerificationFallback(plan, handleResult);
 }
 
+/**
+ * Resolve the Hydra Lite project a request targets from its `?projectId=`
+ * query param. Returns undefined for legacy requests (no query param —
+ * every pre-existing caller), in which case route handlers fall back to
+ * this daemon's own startup project, unchanged from before the registry
+ * existed.
+ */
+function requestedProjectId(requestUrl: URL): string | undefined {
+  return requestUrl.searchParams.get('projectId') ?? undefined;
+}
+
 function buildReadRouteCtx(
   ctx: DaemonContext,
   req: IncomingMessage,
   res: ServerResponse,
   requestUrl: URL,
 ): ReadRouteCtx {
+  const projectId = requestedProjectId(requestUrl);
+  const runtime = resolveRuntime(ctx, projectId);
   return {
     method: req.method ?? 'GET',
     route: requestUrl.pathname,
@@ -509,18 +629,19 @@ function buildReadRouteCtx(
     readStatus: () => JSON.parse(fs.readFileSync(STATUS_PATH, 'utf8')) as Record<string, unknown>,
     checkUsage: checkUsage as unknown as () => UsageCheckResult,
     getModelSummary: getModelSummary as () => Record<string, ModelSummaryEntry>,
-    readState,
+    readState: runtime.stateApi.readState,
     getSummary,
-    projectRoot: config.projectRoot,
-    projectName: config.projectName,
+    projectRoot: runtime.config.projectRoot,
+    projectName: runtime.config.projectName,
     buildPrompt,
     suggestNext,
     readEvents,
-    replayEvents,
+    replayEvents: runtime.stateApi.replayEvents,
     sseClients: ctx.sseClients,
     readArchive,
     getMetricsSummary,
     getEventCount: () => ctx.eventCount,
+    projectId,
   };
 }
 
@@ -531,6 +652,8 @@ function buildWriteRouteCtx(
   res: ServerResponse,
   requestUrl: URL,
 ) {
+  const projectId = requestedProjectId(requestUrl);
+  const runtime = resolveRuntime(ctx, projectId);
   return {
     method: req.method ?? 'GET',
     route: requestUrl.pathname,
@@ -543,25 +666,26 @@ function buildWriteRouteCtx(
       label: string,
       mutator: (state: HydraStateShape) => T,
       detail?: Record<string, unknown>,
-    ) => enqueueMutation(ctx, label, mutator, detail ?? {}),
+    ) => enqueueMutation(ctx, runtime, label, mutator, detail ?? {}),
     ensureKnownAgent,
     ensureKnownStatus,
     parseList,
-    getCurrentBranch,
+    getCurrentBranch: () => _getCurrentBranch(runtime.config.projectRoot),
     toSessionId,
     nowIso,
     classifyTask,
     nextId,
     detectCycle,
     autoUnblock,
-    readState,
+    readState: runtime.stateApi.readState,
+    replayEvents: runtime.stateApi.replayEvents,
     AGENT_NAMES,
     getAgent: getAgent as (name: string) => AgentDef | undefined,
     listAgents: listAgents as (...args: unknown[]) => AgentDef[],
     resolveVerificationPlan: resolveVerificationPlan as unknown as (
       ...args: unknown[]
     ) => Record<string, unknown>,
-    projectRoot: config.projectRoot,
+    projectRoot: runtime.config.projectRoot,
     runVerification: (taskId: unknown, plan: unknown) => {
       runVerification(ctx, taskId as string, plan as Record<string, unknown>);
     },
@@ -570,7 +694,7 @@ function buildWriteRouteCtx(
     writeStatus: (extra?: Record<string, unknown>) => {
       writeStatus(ctx, extra);
     },
-    appendEvent,
+    appendEvent: runtime.stateApi.appendEvent,
     broadcastEvent: (event: unknown) => {
       broadcastEvent(ctx.sseClients, event);
     },
@@ -584,6 +708,8 @@ function buildWriteRouteCtx(
     createTaskWorktree,
     mergeTaskWorktree,
     cleanupTaskWorktree,
+    projectId,
+    countOtherProjectsInFlight: () => countOtherProjectsInFlight(projectId),
   };
 }
 
@@ -630,7 +756,7 @@ async function handleHttpRequest(
 }
 
 function autoArchiveIfNeeded(ctx: DaemonContext) {
-  void enqueueMutation(ctx, 'auto_archive', (state: HydraStateShape) => {
+  void enqueueMutation(ctx, legacyRuntime, 'auto_archive', (state: HydraStateShape) => {
     const completedCount = state.tasks.filter((t: TaskEntry) =>
       ['done', 'cancelled'].includes(t.status),
     ).length;
@@ -851,8 +977,47 @@ function gracefulExit(
   });
 }
 
+/**
+ * Crash-recovery policy for registered Hydra Lite projects only (never the
+ * legacy startup project, whose restart semantics must stay exactly as
+ * before the registry existed): since no process can still be running a
+ * task from a previous daemon instance, any task found `in_progress` is
+ * reset to `todo` on startup, incrementing its `attempts` counter. This is
+ * deliberately simple because milestone-1 tasks are read-only — a crash
+ * mid-task has made zero changes to the project's working tree, so there is
+ * nothing to roll back, only a queue position to restore.
+ */
+function resetStuckTasksForRegisteredProjects(): void {
+  for (const project of listProjects()) {
+    try {
+      const projectConfig = resolveProject({ project: project.path, skipValidation: true });
+      const stateApi = createProjectState({
+        coordDir: projectConfig.coordDir,
+        statePath: projectConfig.statePath,
+        logPath: projectConfig.logPath,
+        eventsPath: projectConfig.eventsPath,
+        projectName: projectConfig.projectName,
+      });
+      const state = stateApi.readState();
+      let changed = false;
+      for (const task of state.tasks) {
+        if (task.status !== 'in_progress') continue;
+        task.status = 'todo';
+        task.attempts = (task.attempts ?? 0) + 1;
+        task.updatedAt = nowIso();
+        changed = true;
+      }
+      if (changed) stateApi.writeState(state);
+    } catch {
+      // Best-effort: an unreadable registered project shouldn't block
+      // daemon startup for every other project.
+    }
+  }
+}
+
 function startDaemon(options: Record<string, string>) {
   ensureCoordFiles();
+  resetStuckTasksForRegisteredProjects();
 
   // Register built-in virtual sub-agents
   try {

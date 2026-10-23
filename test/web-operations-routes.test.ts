@@ -1437,6 +1437,7 @@ function makeWriteCtx(
       createTaskWorktree: () => null,
       mergeTaskWorktree: () => ({}),
       cleanupTaskWorktree: () => {},
+      countOtherProjectsInFlight: () => ({}),
       sseClients: new Set(),
       readArchive: () => ({
         snapshots: [],

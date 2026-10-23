@@ -56,7 +56,7 @@ describe('daemon/state unit tests', () => {
 
   beforeEach(() => {
     // Wipe coord dir before each test for isolation
-    const coordDir = path.join(tmpDir, 'docs', 'coordination');
+    const coordDir = path.join(tmpDir, '.hydra');
     if (fs.existsSync(coordDir)) {
       fs.rmSync(coordDir, { recursive: true, force: true });
     }
@@ -196,7 +196,7 @@ describe('daemon/state unit tests', () => {
   it('appendSyncLog() appends a line containing the entry text', () => {
     mod.ensureCoordFiles();
     mod.appendSyncLog('my-test-entry-xyz');
-    const coordDir = path.join(tmpDir, 'docs', 'coordination');
+    const coordDir = path.join(tmpDir, '.hydra');
     const logPath = path.join(coordDir, 'AI_SYNC_LOG.md');
     const contents = fs.readFileSync(logPath, 'utf8');
     assert.ok(contents.includes('my-test-entry-xyz'));
