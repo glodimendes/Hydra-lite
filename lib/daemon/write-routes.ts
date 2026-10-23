@@ -637,6 +637,7 @@ function mutateTaskUpdate(
       existing.verification = body['verification'] as TaskEntry['verification'];
     }
     if (body['commitSha'] !== undefined) existing.commitSha = body['commitSha'] as string;
+    if (body['attempts'] !== undefined) existing.attempts = Number(body['attempts']);
     existing.updatedAt = nowIso();
     if ((existing as Record<string, unknown>)['stale'] === true) {
       (existing as Record<string, unknown>)['stale'] = false;

@@ -171,17 +171,36 @@ export async function runAsk(
 }
 
 export interface EditResult {
+  threadId: string;
   summary: string;
 }
 
 /**
  * Run an approved edit in `projectRoot`, write-enabled and sandboxed to
- * that directory. The caller (lib/hydra-lite-chat.ts's `/run`) is
- * responsible for the approval check, the clean-working-tree precondition,
- * verification, and the scoped commit — this function only invokes Codex.
+ * that directory — or continue `existingThreadId` with feedback from a
+ * prior failed verification (lib/hydra-lite-chat.ts's `/run` retry loop).
+ * Resuming never re-specifies `-s`/`-C`, so a retry can never land at a
+ * different privilege level than the attempt that created the thread. The
+ * caller is responsible for the approval check, the clean-working-tree
+ * precondition, verification, and the scoped commit — this function only
+ * invokes Codex.
  */
-export async function runEdit(projectRoot: string, prompt: string): Promise<EditResult> {
-  const [cmd, args] = buildEditArgs(prompt, { cwd: projectRoot });
+export async function runEdit(
+  projectRoot: string,
+  prompt: string,
+  existingThreadId?: string,
+): Promise<EditResult> {
+  const [cmd, args] =
+    existingThreadId == null
+      ? buildEditArgs(prompt, { cwd: projectRoot })
+      : buildResumeArgs(existingThreadId, prompt);
   const output = await spawnAndCollect(cmd, args, projectRoot);
-  return { summary: parseAgentMessage(output) ?? '(Codex returned no summary message.)' };
+  const threadId = existingThreadId ?? parseThreadId(output);
+  if (threadId == null) {
+    throw new Error('Codex did not report a thread id for this session.');
+  }
+  return {
+    threadId,
+    summary: parseAgentMessage(output) ?? '(Codex returned no summary message.)',
+  };
 }

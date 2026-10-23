@@ -10,19 +10,24 @@
  * visual helpers for a similar feel, but its own small dispatch loop.
  *
  * Commands (all `/`-prefixed, matching Codex/Claude CLI convention):
- *   /project list            — list registered projects
- *   /project use <name|id>   — switch; resumes or starts that project's session
- *   /edit <instructions>     — queue an approval-gated edit task
- *   /approve <taskId>        — unblock an awaiting_approval task to todo
- *   /run <taskId>            — execute an approved (todo) edit task: claim,
+ *   /project list                — list registered projects
+ *   /project use <name|id>       — switch; resumes or starts that project's session
+ *   /project verify [cmd|auto|off] — show, set, or clear this project's verify override
+ *   /edit <instructions>       — queue an approval-gated edit task
+ *   /approve <taskId>          — unblock an awaiting_approval task to todo
+ *   /run <taskId> [maxAttempts] — execute an approved (todo) edit task: claim,
  *                               invoke Codex in write mode, verify, and (on
- *                               success) make exactly one scoped commit
- *   /quit                    — exit
+ *                               success) make exactly one scoped commit; on
+ *                               a failed verification, retry (resuming the
+ *                               same thread with the failure as feedback)
+ *                               up to maxAttempts (default 2) before blocking
+ *   /quit                      — exit
  * Bare text (no leading /) is an implicit question: a read-only Codex call
  * (lib/hydra-lite-codex-session.ts), resumed across turns within one
  * project so Codex remembers the conversation — never resumed across a
  * privilege boundary (an edit's /run always starts its own fresh,
- * write-enabled session, never resuming a read-only ask-thread).
+ * write-enabled session; a /run retry resumes that session, never a
+ * read-only ask-thread).
  */
 
 import readline from 'node:readline';
@@ -41,7 +46,11 @@ import {
   stageAndCommitFiles,
   isWorkingTreeCleanIgnoringHydraState,
 } from './hydra-lite-git.ts';
-import { resolveVerificationPlan } from './hydra-verification.ts';
+import {
+  loadProjectConfig,
+  saveProjectVerificationOverride,
+  resolveProjectVerificationPlan,
+} from './hydra-lite-project-config.ts';
 import type { HydraStateShape, TaskEntry } from './types.ts';
 
 const DEFAULT_URL = process.env['AI_ORCH_URL'] ?? 'http://127.0.0.1:4173';
@@ -64,12 +73,15 @@ function printWelcome(): void {
   console.log('');
   console.log(`  ${ACCENT('/project list')}            List registered projects`);
   console.log(`  ${ACCENT('/project use <name|id>')}   Switch projects`);
+  console.log(
+    `  ${ACCENT('/project verify [cmd|auto|off]')}  Show/set/clear this project's verify override`,
+  );
   console.log(`  ${ACCENT('/edit <instructions>')}     Propose an edit (needs /approve)`);
   console.log(
     `  ${ACCENT('/approve <taskId>')}        Unblock an edit task (needs /run to execute)`,
   );
   console.log(
-    `  ${ACCENT('/run <taskId>')}            Execute an approved edit: claim, run, verify, commit`,
+    `  ${ACCENT('/run <taskId> [maxAttempts]')}  Execute an approved edit, retrying on verify failure`,
   );
   console.log(`  ${ACCENT('/quit')}                    Exit`);
   console.log(DIM('  Anything else is a question for Codex about the current project.'));
@@ -124,6 +136,35 @@ async function switchProject(state: ConsoleState, nameOrId: string): Promise<voi
   state.currentProject = entry;
 }
 
+/** Print this project's effective verify plan, noting whether it comes
+ * from a project override, the global config, or auto-detection. */
+function printVerifyStatus(project: RegisteredProject): void {
+  const hasOverride = loadProjectConfig(project.path).verification != null;
+  const plan = resolveProjectVerificationPlan(project.path);
+  const status = plan.enabled ? SUCCESS(plan.command) : DIM('disabled');
+  const origin = hasOverride ? 'project override' : plan.source;
+  console.log(`  ${pc.bold(project.name)} verify: ${status} ${DIM(`(${origin})`)}`);
+}
+
+/** Show, set, or clear the current project's `.hydra/config.json` verify
+ * override. "auto" clears it back to the global config / auto-detection;
+ * any other value (including "off") becomes the override's command. */
+function dispatchProjectVerifyCommand(project: RegisteredProject, rest: string): void {
+  const arg = rest.trim();
+  if (arg === '') {
+    printVerifyStatus(project);
+    return;
+  }
+  if (arg === 'auto') {
+    saveProjectVerificationOverride(project.path, null);
+    console.log(SUCCESS(`  Cleared verify override for ${project.name}.`));
+  } else {
+    saveProjectVerificationOverride(project.path, { command: arg });
+    console.log(SUCCESS(`  Set verify override for ${project.name}: ${arg}`));
+  }
+  printVerifyStatus(project);
+}
+
 async function dispatchProjectCommand(state: ConsoleState, rest: string): Promise<void> {
   const [sub, ...args] = rest.trim().split(/\s+/);
   if (sub === 'list' || sub === '') {
@@ -134,7 +175,15 @@ async function dispatchProjectCommand(state: ConsoleState, rest: string): Promis
     await switchProject(state, args.join(' '));
     return;
   }
-  console.log(ERROR(`  Unknown /project subcommand "${sub}". Use list|use.`));
+  if (sub === 'verify') {
+    if (!state.currentProject) {
+      console.log(ERROR('  No current project — run /project use <name|id> first.'));
+      return;
+    }
+    dispatchProjectVerifyCommand(state.currentProject, args.join(' '));
+    return;
+  }
+  console.log(ERROR(`  Unknown /project subcommand "${sub}". Use list|use|verify.`));
 }
 
 async function dispatchEditCommand(state: ConsoleState, instructions: string): Promise<void> {
@@ -180,6 +229,10 @@ async function dispatchApproveCommand(state: ConsoleState, taskId: string): Prom
   console.log(DIM(`  Run /run ${String(task['id'])} to actually execute it.`));
 }
 
+/** `/run <taskId>` with no explicit attempt count retries this many times
+ * total (1 initial attempt + 1 retry) before giving up and blocking. */
+const DEFAULT_MAX_ATTEMPTS = 2;
+
 function runVerifyCommand(
   command: string,
   cwd: string,
@@ -215,6 +268,7 @@ async function markBlocked(
   projectId: string,
   taskId: string,
   note: string,
+  attempts: number,
   verification?: TaskEntry['verification'],
 ): Promise<void> {
   await request('POST', baseUrl, `/task/update?projectId=${projectId}`, {
@@ -222,6 +276,7 @@ async function markBlocked(
     status: 'blocked',
     notes: note,
     verification,
+    attempts,
     verify: false,
   });
 }
@@ -259,81 +314,50 @@ async function loadRunnableTask(
   return task;
 }
 
-/** Claim the task, then invoke Codex in write mode. Returns null (having
- * already reported and blocked the task) on any failure. */
-async function claimAndEdit(
+/** Claim the task so no other claim can touch it while /run works,
+ * including across retries. */
+async function claimTask(
   baseUrl: string,
   project: RegisteredProject,
   taskId: string,
-  task: TaskEntry,
-): Promise<string | null> {
+): Promise<boolean> {
   try {
     await request('POST', baseUrl, `/task/claim?projectId=${project.id}`, {
       taskId,
       agent: 'codex',
     });
+    return true;
   } catch (err: unknown) {
     console.log(
       ERROR(`  Could not claim ${taskId}: ${err instanceof Error ? err.message : String(err)}`),
     );
-    return null;
-  }
-
-  console.log(DIM(`  Running ${taskId}...`));
-  try {
-    const prompt = task.notes === '' ? task.title : task.notes;
-    const { summary } = await runEdit(project.path, prompt);
-    console.log(`  ${summary}`);
-    return summary;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    await markBlocked(
-      baseUrl,
-      project.id,
-      taskId,
-      `[Hydra Lite /run] Codex invocation failed: ${message}`,
-    );
-    console.log(ERROR(`  Codex invocation failed: ${message}`));
-    console.log(DIM(`  ${taskId} set to blocked.`));
-    return null;
+    return false;
   }
 }
 
-/** Run the project's verify command (if any) against the edit Codex just
- * made. Returns null (having already reported and blocked the task) on
- * failure; a passing or skipped verification otherwise. */
-async function verifyEdit(
-  baseUrl: string,
-  project: RegisteredProject,
-  taskId: string,
-): Promise<NonNullable<TaskEntry['verification']> | null> {
-  const plan = resolveVerificationPlan(project.path);
+interface VerifyOutcome {
+  verification: NonNullable<TaskEntry['verification']>;
+  output: string;
+}
+
+/** Run the project's verify command (if any) and just report the outcome —
+ * never touches the task itself. The retry loop in dispatchRunCommand
+ * decides whether a failure means "block" or "retry with feedback". */
+async function runProjectVerification(project: RegisteredProject): Promise<VerifyOutcome> {
+  const plan = resolveProjectVerificationPlan(project.path);
   if (!plan.enabled) {
-    return { passed: true, checkedAt: new Date().toISOString() };
+    return { verification: { passed: true, checkedAt: new Date().toISOString() }, output: '' };
   }
   console.log(DIM(`  Verifying: ${plan.command}`));
-  const verifyResult = await runVerifyCommand(plan.command, project.path, plan.timeoutMs);
-  const verification = {
-    passed: verifyResult.ok,
-    command: plan.command,
-    checkedAt: new Date().toISOString(),
+  const result = await runVerifyCommand(plan.command, project.path, plan.timeoutMs);
+  return {
+    verification: {
+      passed: result.ok,
+      command: plan.command,
+      checkedAt: new Date().toISOString(),
+    },
+    output: result.output,
   };
-  if (verifyResult.ok) {
-    console.log(SUCCESS('  Verification passed.'));
-    return verification;
-  }
-  await markBlocked(
-    baseUrl,
-    project.id,
-    taskId,
-    `[Hydra Lite /run] Verification failed (${plan.command}):\n${verifyResult.output.slice(0, 500)}`,
-    verification,
-  );
-  console.log(ERROR(`  Verification failed: ${plan.command}`));
-  console.log(
-    DIM(`  ${taskId} set to blocked. Working tree left as-is — inspect it at ${project.path}.`),
-  );
-  return null;
 }
 
 /** Stage only the changed files and make exactly one commit, then report
@@ -346,6 +370,7 @@ async function commitEdit(
   task: TaskEntry,
   changedFiles: string[],
   verification: NonNullable<TaskEntry['verification']>,
+  attempts: number,
 ): Promise<void> {
   const title = task.title === '' ? taskId : task.title;
   let sha: string;
@@ -362,6 +387,7 @@ async function commitEdit(
       project.id,
       taskId,
       `[Hydra Lite /run] Edit succeeded and verified, but committing failed: ${message}`,
+      attempts,
       verification,
     );
     console.log(ERROR(`  Commit failed: ${message}`));
@@ -379,6 +405,7 @@ async function commitEdit(
     manifest: changedFiles,
     verification,
     commitSha: sha,
+    attempts,
     verify: false,
   });
   const fileWord = changedFiles.length === 1 ? 'file' : 'files';
@@ -392,30 +419,70 @@ async function commitEdit(
   }
 }
 
+/** The prompt for a retry: the original instructions plus what verification
+ * said was wrong, so Codex fixes its own prior attempt instead of guessing
+ * blind — sent to the SAME resumed thread, so it can see that attempt too. */
+function buildRetryPrompt(task: TaskEntry, failure: VerifyOutcome): string {
+  const original = task.notes === '' ? task.title : task.notes;
+  return [
+    `Verification ("${failure.verification.command ?? ''}") failed after your last change:`,
+    failure.output.slice(0, 1500),
+    '',
+    'Please fix the issue so verification passes. Original task:',
+    original,
+  ].join('\n');
+}
+
+function parseMaxAttempts(raw: string | undefined): number {
+  if (raw == null || raw.trim() === '') return DEFAULT_MAX_ATTEMPTS;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_MAX_ATTEMPTS;
+}
+
+type AttemptOutcome =
+  | { status: 'done' }
+  | { status: 'blocked' }
+  | { status: 'retry'; threadId: string; failure: VerifyOutcome };
+
 /**
- * Execute an already-approved (`todo`) edit task: claim it (subject to the
- * existing concurrency gate), invoke Codex in write mode, verify, and — on
- * success — stage only the changed files and make exactly one commit.
- * Never discards a dirty tree on failure; always reports why and leaves it
- * for inspection, per the agreed design.
+ * Run one Codex attempt (fresh, or resuming `threadId` with `lastFailure`
+ * as feedback), then verify it. Reports and persists every outcome itself
+ * — `dispatchRunCommand`'s loop only has to act on the returned status.
  */
-async function dispatchRunCommand(state: ConsoleState, taskId: string): Promise<void> {
-  if (!state.currentProject) {
-    console.log(ERROR('  No current project — run /project use <name|id> first.'));
-    return;
-  }
-  if (taskId === '') {
-    console.log(ERROR('  Usage: /run <taskId>'));
-    return;
-  }
-  const project = state.currentProject;
-  const { baseUrl } = state;
+async function runOneEditAttempt(
+  baseUrl: string,
+  project: RegisteredProject,
+  taskId: string,
+  task: TaskEntry,
+  attempt: number,
+  maxAttempts: number,
+  threadId: string | undefined,
+  lastFailure: VerifyOutcome | null,
+): Promise<AttemptOutcome> {
+  console.log(DIM(`  Running ${taskId} (attempt ${String(attempt)}/${String(maxAttempts)})...`));
+  const originalPrompt = task.notes === '' ? task.title : task.notes;
+  const prompt = lastFailure == null ? originalPrompt : buildRetryPrompt(task, lastFailure);
 
-  const task = await loadRunnableTask(baseUrl, project, taskId);
-  if (!task) return;
-
-  const summary = await claimAndEdit(baseUrl, project, taskId, task);
-  if (summary == null) return;
+  let nextThreadId: string;
+  let summary: string;
+  try {
+    const result = await runEdit(project.path, prompt, threadId);
+    nextThreadId = result.threadId;
+    summary = result.summary;
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    await markBlocked(
+      baseUrl,
+      project.id,
+      taskId,
+      `[Hydra Lite /run] Codex invocation failed on attempt ${String(attempt)}: ${message}`,
+      attempt,
+    );
+    console.log(ERROR(`  Codex invocation failed: ${message}`));
+    console.log(DIM(`  ${taskId} set to blocked.`));
+    return { status: 'blocked' };
+  }
+  console.log(`  ${summary}`);
 
   const changedFiles = listChangedFiles(project.path);
   if (changedFiles.length === 0) {
@@ -424,16 +491,95 @@ async function dispatchRunCommand(state: ConsoleState, taskId: string): Promise<
       status: 'done',
       manifest: [],
       verification: { passed: true, checkedAt: new Date().toISOString() },
+      attempts: attempt,
       verify: false,
     });
     console.log(SUCCESS(`  Codex made no file changes. ${taskId} marked done.`));
-    return;
+    return { status: 'done' };
   }
 
-  const verification = await verifyEdit(baseUrl, project, taskId);
-  if (!verification) return;
+  const outcome = await runProjectVerification(project);
+  if (outcome.verification.passed) {
+    console.log(SUCCESS('  Verification passed.'));
+    await commitEdit(baseUrl, project, taskId, task, changedFiles, outcome.verification, attempt);
+    return { status: 'done' };
+  }
 
-  await commitEdit(baseUrl, project, taskId, task, changedFiles, verification);
+  console.log(
+    ERROR(
+      `  Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
+    ),
+  );
+  if (attempt < maxAttempts) {
+    console.log(DIM('  Retrying with the failure as feedback...'));
+    return { status: 'retry', threadId: nextThreadId, failure: outcome };
+  }
+  await markBlocked(
+    baseUrl,
+    project.id,
+    taskId,
+    `[Hydra Lite /run] Verification failed after ${String(attempt)} attempt(s) (${outcome.verification.command ?? ''}):\n${outcome.output.slice(0, 500)}`,
+    attempt,
+    outcome.verification,
+  );
+  console.log(
+    DIM(
+      `  ${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
+    ),
+  );
+  return { status: 'blocked' };
+}
+
+/**
+ * Execute an already-approved (`todo`) edit task: claim it once (subject
+ * to the existing concurrency gate), then make up to `maxAttempts` Codex
+ * attempts via runOneEditAttempt, each followed by verification. A retry
+ * resumes the SAME write-mode thread with the verification failure as
+ * feedback — never a fresh session, so Codex sees exactly what it tried
+ * before — and never resumes across a privilege boundary, since every
+ * attempt in this loop is already write-mode. Stops at the first attempt
+ * that verifies cleanly; a Codex-invocation failure (as opposed to a
+ * verification failure) blocks immediately, since there is no useful
+ * feedback to retry with. Never discards a dirty tree — a task that
+ * exhausts every attempt is left blocked with the tree as Codex left it.
+ */
+async function dispatchRunCommand(state: ConsoleState, rawArgs: string): Promise<void> {
+  if (!state.currentProject) {
+    console.log(ERROR('  No current project — run /project use <name|id> first.'));
+    return;
+  }
+  const [taskId, maxAttemptsArg] = rawArgs.trim().split(/\s+/);
+  if (taskId === '') {
+    console.log(ERROR('  Usage: /run <taskId> [maxAttempts]'));
+    return;
+  }
+  const maxAttempts = parseMaxAttempts(maxAttemptsArg);
+  const project = state.currentProject;
+  const { baseUrl } = state;
+
+  const task = await loadRunnableTask(baseUrl, project, taskId);
+  if (!task) return;
+  if (!(await claimTask(baseUrl, project, taskId))) return;
+
+  let threadId: string | undefined;
+  let lastFailure: VerifyOutcome | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // eslint-disable-next-line no-await-in-loop -- intentionally sequential: each retry must see the previous attempt's verification result before deciding whether to try again
+    const outcome = await runOneEditAttempt(
+      baseUrl,
+      project,
+      taskId,
+      task,
+      attempt,
+      maxAttempts,
+      threadId,
+      lastFailure,
+    );
+    if (outcome.status !== 'retry') return;
+    threadId = outcome.threadId;
+    lastFailure = outcome.failure;
+  }
 }
 
 async function dispatchAsk(state: ConsoleState, question: string): Promise<void> {
