@@ -142,7 +142,11 @@ export function scanTodoComments(projectRoot: string): ScannedTask[] {
       'grep',
       '-n',
       '-i',
-      '-E',
+      // -P (Perl-compatible), not -E (POSIX extended): confirmed hands-on
+      // that at least one git build in the wild (2.56.0) silently treats
+      // \b as a no-op under -E, so this pattern matches nothing at all —
+      // -P supports \b correctly and keeps the same pattern syntax.
+      '-P',
       '\\b(TODO|FIXME|HACK|XXX)\\b',
       '--',
       '*.mjs',
