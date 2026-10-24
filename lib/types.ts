@@ -206,6 +206,11 @@ export interface HydraLiteTaskFields {
   attempts?: number;
   /** Local commit SHA produced by the (future) verify+commit step. */
   commitSha?: string;
+  /** Relative scheduling priority within this task's project, for the
+   * worker's weighted round-robin pick order (lib/hydra-lite-worker.ts).
+   * Default 0 when unset. Purely advisory — never affects the concurrency
+   * gate or what a human can claim/run manually via the chat console. */
+  priority?: number;
 }
 
 /** Shape of a task record as stored in daemon state.tasks[] */

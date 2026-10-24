@@ -30,7 +30,20 @@ export interface ProjectVerificationOverride {
 
 export interface HydraLiteProjectConfig {
   verification?: ProjectVerificationOverride;
+  /** Overrides DEFAULT_TASK_TIMEOUT_MINUTES (lib/hydra-lite-run-edit.ts) for
+   * this project's own Codex edit attempts — a bigger/slower project can
+   * raise its own budget without changing the global default. */
+  taskTimeoutMinutes?: number;
 }
+
+/** Hard default for how long one Codex edit attempt may run before the
+ * worker/`/run` kills it and treats it as a failed attempt. Grounded in
+ * production CI/CD conventions (GitHub Actions' per-job default is 360
+ * minutes, GitLab CI's is commonly ~60) scaled down for a single attempt,
+ * and in observed agentic-coding practice (one real project settled on a
+ * single ~30-minute global default after per-task tiers proved to be
+ * maintenance overhead not worth the precision). */
+export const DEFAULT_TASK_TIMEOUT_MINUTES = 30;
 
 function configPath(projectRoot: string): string {
   return path.join(projectRoot, '.hydra', 'config.json');
@@ -62,6 +75,27 @@ export function saveProjectVerificationOverride(
     next.verification = { ...current.verification, ...override };
   }
   atomicWriteJson(configPath(projectRoot), next);
+}
+
+/** Set (override) or clear (pass null) the project's per-attempt Codex
+ * edit timeout, in minutes. */
+export function saveProjectTaskTimeoutOverride(projectRoot: string, minutes: number | null): void {
+  const current = loadProjectConfig(projectRoot);
+  const next: HydraLiteProjectConfig = { ...current };
+  if (minutes == null) {
+    delete next.taskTimeoutMinutes;
+  } else {
+    next.taskTimeoutMinutes = minutes;
+  }
+  atomicWriteJson(configPath(projectRoot), next);
+}
+
+/** Effective per-attempt Codex edit timeout for `projectRoot`, in
+ * milliseconds: the project's own override if set, else
+ * DEFAULT_TASK_TIMEOUT_MINUTES. */
+export function resolveProjectTaskTimeoutMs(projectRoot: string): number {
+  const minutes = loadProjectConfig(projectRoot).taskTimeoutMinutes ?? DEFAULT_TASK_TIMEOUT_MINUTES;
+  return minutes * 60_000;
 }
 
 /**

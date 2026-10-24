@@ -638,6 +638,7 @@ function mutateTaskUpdate(
     }
     if (body['commitSha'] !== undefined) existing.commitSha = body['commitSha'] as string;
     if (body['attempts'] !== undefined) existing.attempts = Number(body['attempts']);
+    if (body['priority'] !== undefined) existing.priority = Number(body['priority']);
     existing.updatedAt = nowIso();
     if ((existing as Record<string, unknown>)['stale'] === true) {
       (existing as Record<string, unknown>)['stale'] = false;

@@ -7,6 +7,7 @@
  *   list                    — List registered projects (id, name, path)
  *   use <id>                — Set the CLI's "current project" convenience pointer
  *   remove <id> [--purge]   — Unregister a project; --purge also deletes .hydra/
+ *   priority <id> <n>       — Set a project's worker scheduling priority (default 0)
  *
  * Usage:
  *   node lib/hydra-project-cli.ts add /path/to/repo
@@ -14,6 +15,7 @@
  *   node lib/hydra-project-cli.ts use <id>
  *   node lib/hydra-project-cli.ts remove <id>
  *   node lib/hydra-project-cli.ts remove <id> --purge
+ *   node lib/hydra-project-cli.ts priority <id> <n>
  */
 
 import pc from 'picocolors';
@@ -23,12 +25,15 @@ import {
   listProjects,
   useProject,
   removeProject,
+  setProjectPriority,
   getCurrentProjectId,
   ProjectRegistryError,
 } from './hydra-registry.ts';
 
 function printUsage(): void {
-  console.error('Usage: hydra-project-cli.ts [add <path>|list|use <id>|remove <id> [--purge]]');
+  console.error(
+    'Usage: hydra-project-cli.ts [add <path>|list|use <id>|remove <id> [--purge]|priority <id> <n>]',
+  );
 }
 
 function addCommand(positionals: string[], options: Record<string, string | boolean>): void {
@@ -79,6 +84,19 @@ function removeCommand(positionals: string[], options: Record<string, string | b
   console.log(pc.green(`Removed project ${id}${purge ? ' (and deleted its .hydra/ state)' : ''}.`));
 }
 
+function priorityCommand(positionals: string[]): void {
+  const id = positionals.at(0);
+  const rawValue = positionals.at(1);
+  const value = rawValue == null ? Number.NaN : Number.parseInt(rawValue, 10);
+  if (id == null || id === '' || !Number.isFinite(value)) {
+    console.error(pc.red('Usage: project priority <id> <n>'));
+    process.exitCode = 1;
+    return;
+  }
+  const entry = setProjectPriority(id, value);
+  console.log(pc.green(`${entry.name} priority is now ${String(entry.priority)}.`));
+}
+
 function main(): void {
   const { command, options, positionals } = parseArgsWithCommand(process.argv);
 
@@ -95,6 +113,9 @@ function main(): void {
         break;
       case 'remove':
         removeCommand(positionals, options);
+        break;
+      case 'priority':
+        priorityCommand(positionals);
         break;
       case 'help':
         printUsage();

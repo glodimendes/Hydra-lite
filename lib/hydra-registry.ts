@@ -73,6 +73,10 @@ export interface RegisteredProject {
   id: string;
   name: string;
   path: string;
+  /** Relative scheduling weight for lib/hydra-lite-worker.ts's weighted
+   * round-robin pick order across projects. Default 0 when unset (weight 1
+   * — see worker-schedule.ts's weightFromPriority). Purely advisory. */
+  priority?: number;
 }
 
 interface RegistryFile {
@@ -189,6 +193,17 @@ export function useProject(id: string): RegisteredProject {
   const entry = registry.projects.find((p) => p.id === id);
   if (!entry) throw new ProjectRegistryError(`No registered project with id: ${id}`);
   registry.current = id;
+  writeRegistry(registry);
+  return entry;
+}
+
+/** Set a registered project's scheduling priority (see RegisteredProject's
+ * `priority` field). Any integer is accepted, including negative. */
+export function setProjectPriority(id: string, priority: number): RegisteredProject {
+  const registry = readRegistry();
+  const entry = registry.projects.find((p) => p.id === id);
+  if (!entry) throw new ProjectRegistryError(`No registered project with id: ${id}`);
+  entry.priority = Math.trunc(priority);
   writeRegistry(registry);
   return entry;
 }

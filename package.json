@@ -48,6 +48,7 @@
     "models:select": "node lib/hydra-models-select.ts",
     "project": "node lib/hydra-project-cli.ts",
     "chat": "node lib/hydra-lite-chat.ts",
+    "worker": "node lib/hydra-lite-worker.ts",
     "setup": "node lib/hydra-setup.ts setup",
     "init": "node lib/hydra-setup.ts init",
     "init:daemon": "node lib/orchestrator-client.ts init",

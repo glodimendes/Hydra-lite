@@ -13,8 +13,10 @@
  *   /project list                — list registered projects
  *   /project use <name|id>       — switch; resumes or starts that project's session
  *   /project verify [cmd|auto|off] — show, set, or clear this project's verify override
+ *   /project priority <name|id> <n> — set a project's worker scheduling priority
  *   /edit <instructions>       — queue an approval-gated edit task
  *   /approve <taskId>          — unblock an awaiting_approval task to todo
+ *   /priority <taskId> <n>     — set a task's scheduling priority (default 0)
  *   /run <taskId> [maxAttempts] — execute an approved (todo) edit task: claim,
  *                               invoke Codex in write mode, verify, and (on
  *                               success) make exactly one scoped commit; on
@@ -32,26 +34,27 @@
 
 import readline from 'node:readline';
 import pc from 'picocolors';
-import { exec } from 'node:child_process';
 import { ACCENT, DIM, ERROR, SUCCESS, hydraLogoCompact, divider } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import {
   listProjects,
   resolveProjectByNameOrId,
+  setProjectPriority,
   type RegisteredProject,
 } from './hydra-registry.ts';
-import { runAsk, runEdit } from './hydra-lite-codex-session.ts';
-import {
-  listChangedFiles,
-  stageAndCommitFiles,
-  isWorkingTreeCleanIgnoringHydraState,
-} from './hydra-lite-git.ts';
+import { runAsk } from './hydra-lite-codex-session.ts';
 import {
   loadProjectConfig,
   saveProjectVerificationOverride,
   resolveProjectVerificationPlan,
 } from './hydra-lite-project-config.ts';
-import type { HydraStateShape, TaskEntry } from './types.ts';
+import {
+  loadRunnableTask,
+  claimTask,
+  runEditWithRetries,
+  parseMaxAttempts,
+} from './hydra-lite-run-edit.ts';
+import type { HydraStateShape } from './types.ts';
 
 const DEFAULT_URL = process.env['AI_ORCH_URL'] ?? 'http://127.0.0.1:4173';
 
@@ -76,10 +79,14 @@ function printWelcome(): void {
   console.log(
     `  ${ACCENT('/project verify [cmd|auto|off]')}  Show/set/clear this project's verify override`,
   );
+  console.log(
+    `  ${ACCENT('/project priority <name|id> <n>')}  Set a project's worker scheduling priority`,
+  );
   console.log(`  ${ACCENT('/edit <instructions>')}     Propose an edit (needs /approve)`);
   console.log(
     `  ${ACCENT('/approve <taskId>')}        Unblock an edit task (needs /run to execute)`,
   );
+  console.log(`  ${ACCENT('/priority <taskId> <n>')}   Set a task's scheduling priority`);
   console.log(
     `  ${ACCENT('/run <taskId> [maxAttempts]')}  Execute an approved edit, retrying on verify failure`,
   );
@@ -165,6 +172,25 @@ function dispatchProjectVerifyCommand(project: RegisteredProject, rest: string):
   printVerifyStatus(project);
 }
 
+/** Set a registered project's scheduling priority (default 0, higher =
+ * proportionally more of the worker's weighted-round-robin attention). */
+function dispatchProjectPriorityCommand(args: string[]): void {
+  const nameOrId = args.at(0);
+  const rawValue = args.at(1);
+  const entry = nameOrId == null ? undefined : resolveProjectByNameOrId(nameOrId);
+  if (!entry || rawValue == null || rawValue.trim() === '') {
+    console.log(ERROR('  Usage: /project priority <name|id> <n>'));
+    return;
+  }
+  const value = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(value)) {
+    console.log(ERROR(`  Priority must be an integer, got "${rawValue}".`));
+    return;
+  }
+  const updated = setProjectPriority(entry.id, value);
+  console.log(SUCCESS(`  ${updated.name} priority is now ${String(updated.priority)}.`));
+}
+
 async function dispatchProjectCommand(state: ConsoleState, rest: string): Promise<void> {
   const [sub, ...args] = rest.trim().split(/\s+/);
   if (sub === 'list' || sub === '') {
@@ -183,7 +209,36 @@ async function dispatchProjectCommand(state: ConsoleState, rest: string): Promis
     dispatchProjectVerifyCommand(state.currentProject, args.join(' '));
     return;
   }
-  console.log(ERROR(`  Unknown /project subcommand "${sub}". Use list|use|verify.`));
+  if (sub === 'priority') {
+    dispatchProjectPriorityCommand(args);
+    return;
+  }
+  console.log(ERROR(`  Unknown /project subcommand "${sub}". Use list|use|verify|priority.`));
+}
+
+/** Set a task's scheduling priority (default 0, higher = picked first
+ * among its own project's runnable tasks, and tie-breaks the project's
+ * share of the worker's weighted round-robin — see hydra-lite-worker.ts). */
+async function dispatchPriorityCommand(state: ConsoleState, rawArgs: string): Promise<void> {
+  if (!state.currentProject) {
+    console.log(ERROR('  No current project — run /project use <name|id> first.'));
+    return;
+  }
+  const tokens = rawArgs.trim().split(/\s+/);
+  const taskId = tokens.at(0);
+  const rawValue = tokens.at(1);
+  const value = rawValue == null ? Number.NaN : Number.parseInt(rawValue, 10);
+  if (taskId == null || taskId === '' || !Number.isFinite(value)) {
+    console.log(ERROR('  Usage: /priority <taskId> <n>'));
+    return;
+  }
+  const { task } = await request<{ task: Record<string, unknown> }>(
+    'POST',
+    state.baseUrl,
+    `/task/update?projectId=${state.currentProject.id}`,
+    { taskId, priority: value },
+  );
+  console.log(SUCCESS(`  ${String(task['id'])} priority is now ${String(task['priority'])}.`));
 }
 
 async function dispatchEditCommand(state: ConsoleState, instructions: string): Promise<void> {
@@ -229,319 +284,13 @@ async function dispatchApproveCommand(state: ConsoleState, taskId: string): Prom
   console.log(DIM(`  Run /run ${String(task['id'])} to actually execute it.`));
 }
 
-/** `/run <taskId>` with no explicit attempt count retries this many times
- * total (1 initial attempt + 1 retry) before giving up and blocking. */
-const DEFAULT_MAX_ATTEMPTS = 2;
-
-function runVerifyCommand(
-  command: string,
-  cwd: string,
-  timeoutMs: number,
-): Promise<{
-  ok: boolean;
-  output: string;
-}> {
-  return new Promise((resolve) => {
-    exec(command, { cwd, timeout: timeoutMs, encoding: 'utf8' }, (error, stdout, stderr) => {
-      resolve({ ok: error == null, output: `${stdout}${stderr}`.trim() });
-    });
-  });
-}
-
-/** Load the task directly from the project's state (not the registry) —
- * `/run` needs the full record (effect, status, notes), not just an id. */
-async function loadTask(
-  baseUrl: string,
-  projectId: string,
-  taskId: string,
-): Promise<TaskEntry | undefined> {
-  const { state: projectState } = await request<{ state: HydraStateShape }>(
-    'GET',
-    baseUrl,
-    `/state?projectId=${projectId}`,
-  );
-  return projectState.tasks.find((t) => t.id === taskId);
-}
-
-async function markBlocked(
-  baseUrl: string,
-  projectId: string,
-  taskId: string,
-  note: string,
-  attempts: number,
-  verification?: TaskEntry['verification'],
-): Promise<void> {
-  await request('POST', baseUrl, `/task/update?projectId=${projectId}`, {
-    taskId,
-    status: 'blocked',
-    notes: note,
-    verification,
-    attempts,
-    verify: false,
-  });
-}
-
-/** Load + validate the task /run was asked to execute. Prints its own
- * error and returns null when it isn't runnable; never throws. */
-async function loadRunnableTask(
-  baseUrl: string,
-  project: RegisteredProject,
-  taskId: string,
-): Promise<TaskEntry | null> {
-  const task = await loadTask(baseUrl, project.id, taskId);
-  if (!task) {
-    console.log(ERROR(`  No task ${taskId} in ${project.name}.`));
-    return null;
-  }
-  if (task.effect !== 'edit') {
-    console.log(ERROR(`  ${taskId} is not an edit task.`));
-    return null;
-  }
-  if (task.status !== 'todo') {
-    console.log(
-      ERROR(`  ${taskId} is "${task.status}", not approved-and-ready. Approve it first.`),
-    );
-    return null;
-  }
-  if (!isWorkingTreeCleanIgnoringHydraState(project.path)) {
-    console.log(
-      ERROR(
-        '  Working tree has uncommitted changes — refusing to risk attributing them to this task. Commit or stash first.',
-      ),
-    );
-    return null;
-  }
-  return task;
-}
-
-/** Claim the task so no other claim can touch it while /run works,
- * including across retries. */
-async function claimTask(
-  baseUrl: string,
-  project: RegisteredProject,
-  taskId: string,
-): Promise<boolean> {
-  try {
-    await request('POST', baseUrl, `/task/claim?projectId=${project.id}`, {
-      taskId,
-      agent: 'codex',
-    });
-    return true;
-  } catch (err: unknown) {
-    console.log(
-      ERROR(`  Could not claim ${taskId}: ${err instanceof Error ? err.message : String(err)}`),
-    );
-    return false;
-  }
-}
-
-interface VerifyOutcome {
-  verification: NonNullable<TaskEntry['verification']>;
-  output: string;
-}
-
-/** Run the project's verify command (if any) and just report the outcome —
- * never touches the task itself. The retry loop in dispatchRunCommand
- * decides whether a failure means "block" or "retry with feedback". */
-async function runProjectVerification(project: RegisteredProject): Promise<VerifyOutcome> {
-  const plan = resolveProjectVerificationPlan(project.path);
-  if (!plan.enabled) {
-    return { verification: { passed: true, checkedAt: new Date().toISOString() }, output: '' };
-  }
-  console.log(DIM(`  Verifying: ${plan.command}`));
-  const result = await runVerifyCommand(plan.command, project.path, plan.timeoutMs);
-  return {
-    verification: {
-      passed: result.ok,
-      command: plan.command,
-      checkedAt: new Date().toISOString(),
-    },
-    output: result.output,
-  };
-}
-
-/** Stage only the changed files and make exactly one commit, then report
- * the result to the daemon. Blocks the task (keeping the verified
- * verification result) rather than discarding anything on commit failure. */
-async function commitEdit(
-  baseUrl: string,
-  project: RegisteredProject,
-  taskId: string,
-  task: TaskEntry,
-  changedFiles: string[],
-  verification: NonNullable<TaskEntry['verification']>,
-  attempts: number,
-): Promise<void> {
-  const title = task.title === '' ? taskId : task.title;
-  let sha: string;
-  try {
-    sha = stageAndCommitFiles(
-      project.path,
-      changedFiles,
-      `Hydra Lite: ${title}\n\nTask-Id: ${taskId}`,
-    ).sha;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    await markBlocked(
-      baseUrl,
-      project.id,
-      taskId,
-      `[Hydra Lite /run] Edit succeeded and verified, but committing failed: ${message}`,
-      attempts,
-      verification,
-    );
-    console.log(ERROR(`  Commit failed: ${message}`));
-    console.log(
-      DIM(
-        `  ${taskId} set to blocked. Changes are verified but still uncommitted at ${project.path}.`,
-      ),
-    );
-    return;
-  }
-
-  await request('POST', baseUrl, `/task/update?projectId=${project.id}`, {
-    taskId,
-    status: 'done',
-    manifest: changedFiles,
-    verification,
-    commitSha: sha,
-    attempts,
-    verify: false,
-  });
-  const fileWord = changedFiles.length === 1 ? 'file' : 'files';
-  console.log(
-    SUCCESS(
-      `  ${taskId} done. Committed ${sha.slice(0, 10)} (${String(changedFiles.length)} ${fileWord}).`,
-    ),
-  );
-  for (const file of changedFiles) {
-    console.log(DIM(`    ${file}`));
-  }
-}
-
-/** The prompt for a retry: the original instructions plus what verification
- * said was wrong, so Codex fixes its own prior attempt instead of guessing
- * blind — sent to the SAME resumed thread, so it can see that attempt too. */
-function buildRetryPrompt(task: TaskEntry, failure: VerifyOutcome): string {
-  const original = task.notes === '' ? task.title : task.notes;
-  return [
-    `Verification ("${failure.verification.command ?? ''}") failed after your last change:`,
-    failure.output.slice(0, 1500),
-    '',
-    'Please fix the issue so verification passes. Original task:',
-    original,
-  ].join('\n');
-}
-
-function parseMaxAttempts(raw: string | undefined): number {
-  if (raw == null || raw.trim() === '') return DEFAULT_MAX_ATTEMPTS;
-  const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed >= 1 ? parsed : DEFAULT_MAX_ATTEMPTS;
-}
-
-type AttemptOutcome =
-  | { status: 'done' }
-  | { status: 'blocked' }
-  | { status: 'retry'; threadId: string; failure: VerifyOutcome };
-
-/**
- * Run one Codex attempt (fresh, or resuming `threadId` with `lastFailure`
- * as feedback), then verify it. Reports and persists every outcome itself
- * — `dispatchRunCommand`'s loop only has to act on the returned status.
- */
-async function runOneEditAttempt(
-  baseUrl: string,
-  project: RegisteredProject,
-  taskId: string,
-  task: TaskEntry,
-  attempt: number,
-  maxAttempts: number,
-  threadId: string | undefined,
-  lastFailure: VerifyOutcome | null,
-): Promise<AttemptOutcome> {
-  console.log(DIM(`  Running ${taskId} (attempt ${String(attempt)}/${String(maxAttempts)})...`));
-  const originalPrompt = task.notes === '' ? task.title : task.notes;
-  const prompt = lastFailure == null ? originalPrompt : buildRetryPrompt(task, lastFailure);
-
-  let nextThreadId: string;
-  let summary: string;
-  try {
-    const result = await runEdit(project.path, prompt, threadId);
-    nextThreadId = result.threadId;
-    summary = result.summary;
-  } catch (err: unknown) {
-    const message = err instanceof Error ? err.message : String(err);
-    await markBlocked(
-      baseUrl,
-      project.id,
-      taskId,
-      `[Hydra Lite /run] Codex invocation failed on attempt ${String(attempt)}: ${message}`,
-      attempt,
-    );
-    console.log(ERROR(`  Codex invocation failed: ${message}`));
-    console.log(DIM(`  ${taskId} set to blocked.`));
-    return { status: 'blocked' };
-  }
-  console.log(`  ${summary}`);
-
-  const changedFiles = listChangedFiles(project.path);
-  if (changedFiles.length === 0) {
-    await request('POST', baseUrl, `/task/update?projectId=${project.id}`, {
-      taskId,
-      status: 'done',
-      manifest: [],
-      verification: { passed: true, checkedAt: new Date().toISOString() },
-      attempts: attempt,
-      verify: false,
-    });
-    console.log(SUCCESS(`  Codex made no file changes. ${taskId} marked done.`));
-    return { status: 'done' };
-  }
-
-  const outcome = await runProjectVerification(project);
-  if (outcome.verification.passed) {
-    console.log(SUCCESS('  Verification passed.'));
-    await commitEdit(baseUrl, project, taskId, task, changedFiles, outcome.verification, attempt);
-    return { status: 'done' };
-  }
-
-  console.log(
-    ERROR(
-      `  Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
-    ),
-  );
-  if (attempt < maxAttempts) {
-    console.log(DIM('  Retrying with the failure as feedback...'));
-    return { status: 'retry', threadId: nextThreadId, failure: outcome };
-  }
-  await markBlocked(
-    baseUrl,
-    project.id,
-    taskId,
-    `[Hydra Lite /run] Verification failed after ${String(attempt)} attempt(s) (${outcome.verification.command ?? ''}):\n${outcome.output.slice(0, 500)}`,
-    attempt,
-    outcome.verification,
-  );
-  console.log(
-    DIM(
-      `  ${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
-    ),
-  );
-  return { status: 'blocked' };
-}
-
 /**
  * Execute an already-approved (`todo`) edit task: claim it once (subject
- * to the existing concurrency gate), then make up to `maxAttempts` Codex
- * attempts via runOneEditAttempt, each followed by verification. A retry
- * resumes the SAME write-mode thread with the verification failure as
- * feedback — never a fresh session, so Codex sees exactly what it tried
- * before — and never resumes across a privilege boundary, since every
- * attempt in this loop is already write-mode. Stops at the first attempt
- * that verifies cleanly; a Codex-invocation failure (as opposed to a
- * verification failure) blocks immediately, since there is no useful
- * feedback to retry with. Never discards a dirty tree — a task that
- * exhausts every attempt is left blocked with the tree as Codex left it.
+ * to the existing concurrency gate), then delegate the attempt/retry/
+ * verify/commit loop to lib/hydra-lite-run-edit.ts's runEditWithRetries —
+ * the same shared logic the unattended worker uses, so behavior can't
+ * drift between a human running `/run` and the worker running the same
+ * task type unattended.
  */
 async function dispatchRunCommand(state: ConsoleState, rawArgs: string): Promise<void> {
   if (!state.currentProject) {
@@ -561,25 +310,7 @@ async function dispatchRunCommand(state: ConsoleState, rawArgs: string): Promise
   if (!task) return;
   if (!(await claimTask(baseUrl, project, taskId))) return;
 
-  let threadId: string | undefined;
-  let lastFailure: VerifyOutcome | null = null;
-
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    // eslint-disable-next-line no-await-in-loop -- intentionally sequential: each retry must see the previous attempt's verification result before deciding whether to try again
-    const outcome = await runOneEditAttempt(
-      baseUrl,
-      project,
-      taskId,
-      task,
-      attempt,
-      maxAttempts,
-      threadId,
-      lastFailure,
-    );
-    if (outcome.status !== 'retry') return;
-    threadId = outcome.threadId;
-    lastFailure = outcome.failure;
-  }
+  await runEditWithRetries(baseUrl, project, taskId, task, maxAttempts);
 }
 
 async function dispatchAsk(state: ConsoleState, question: string): Promise<void> {
@@ -615,6 +346,10 @@ async function dispatchLine(state: ConsoleState, line: string): Promise<boolean>
   }
   if (trimmed.startsWith('/run ')) {
     await dispatchRunCommand(state, trimmed.slice('/run '.length).trim());
+    return true;
+  }
+  if (trimmed.startsWith('/priority ')) {
+    await dispatchPriorityCommand(state, trimmed.slice('/priority '.length));
     return true;
   }
   if (trimmed.startsWith('/')) {

@@ -113,19 +113,49 @@ export function parseAgentMessage(jsonlOutput: string): string | null {
   return last?.item.text ?? null;
 }
 
-function spawnAndCollect(cmd: string, args: string[], cwd: string): Promise<string> {
+/**
+ * Spawn `cmd`/`args` and collect its output. When `timeoutMs` is given, a
+ * still-running child is killed (SIGTERM, then SIGKILL if it hasn't exited
+ * within 5s) and the promise rejects — the harness enforces this bound
+ * itself rather than trusting Codex to self-report how long it'll take
+ * (confirmed unreliable: coding agents including Codex over-predict their
+ * own wall-clock runtime).
+ */
+function spawnAndCollect(
+  cmd: string,
+  args: string[],
+  cwd: string,
+  timeoutMs?: number,
+): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
+    let timedOut = false;
+    const timer =
+      timeoutMs == null
+        ? null
+        : setTimeout(() => {
+            timedOut = true;
+            child.kill('SIGTERM');
+            setTimeout(() => child.kill('SIGKILL'), 5000);
+          }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
       stdout += chunk;
     });
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
       stderr += chunk;
     });
-    child.on('error', reject);
+    child.on('error', (err) => {
+      if (timer != null) clearTimeout(timer);
+      reject(err);
+    });
     child.on('close', (code) => {
+      if (timer != null) clearTimeout(timer);
+      if (timedOut) {
+        reject(new Error(`codex timed out after ${String(timeoutMs)}ms and was killed`));
+        return;
+      }
       if (code !== 0) {
         reject(
           new Error(
@@ -183,18 +213,21 @@ export interface EditResult {
  * different privilege level than the attempt that created the thread. The
  * caller is responsible for the approval check, the clean-working-tree
  * precondition, verification, and the scoped commit — this function only
- * invokes Codex.
+ * invokes Codex. `timeoutMs`, when given, kills the Codex process if it
+ * hasn't finished in time (see spawnAndCollect) rather than letting it hang
+ * indefinitely, which is what happened with no timeout at all.
  */
 export async function runEdit(
   projectRoot: string,
   prompt: string,
   existingThreadId?: string,
+  timeoutMs?: number,
 ): Promise<EditResult> {
   const [cmd, args] =
     existingThreadId == null
       ? buildEditArgs(prompt, { cwd: projectRoot })
       : buildResumeArgs(existingThreadId, prompt);
-  const output = await spawnAndCollect(cmd, args, projectRoot);
+  const output = await spawnAndCollect(cmd, args, projectRoot, timeoutMs);
   const threadId = existingThreadId ?? parseThreadId(output);
   if (threadId == null) {
     throw new Error('Codex did not report a thread id for this session.');
