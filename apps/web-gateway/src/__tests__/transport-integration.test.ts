@@ -40,6 +40,17 @@ async function listen(server: Server): Promise<number> {
   return address.port;
 }
 
+/**
+ * server.close()'s callback only fires once every tracked connection has
+ * ended. A WebSocket-upgraded connection that was closed or terminated by
+ * the caller (afterEach's socket.close()/wsServer.close()) without that
+ * teardown being awaited can occasionally still be mid-flight from the
+ * HTTP server's point of view, leaving server.close() to wait forever —
+ * reproduced directly (a describe block's next test's beforeEach/it never
+ * runs; Node reports "Promise resolution is still pending but the event
+ * loop has already resolved"). closeAllConnections() force-destroys
+ * anything still tracked, so the close callback always fires promptly.
+ */
 async function closeServer(server: Server): Promise<void> {
   await new Promise<void>((resolve, reject) => {
     server.close((error) => {
@@ -49,6 +60,7 @@ async function closeServer(server: Server): Promise<void> {
       }
       resolve();
     });
+    server.closeAllConnections();
   });
 }
 
@@ -69,9 +81,31 @@ function rawDataToJson(data: WebSocket.RawData): Record<string, unknown> {
   return parsed as Record<string, unknown>;
 }
 
+/**
+ * Session-bootstrap message types sent asynchronously on connect/recovery
+ * (session-ws-bridge.ts's #emitActiveBootstrap/#emitExpiringSoonBootstrap),
+ * independent of whatever a test does next — their exact arrival time
+ * relative to a test's own trigger is a genuine production-code race, not
+ * a test-environment timing issue (confirmed by reading the source and by
+ * reproducing it directly). This file never asserts on their content (no
+ * test anywhere checks for these type strings), so every message reader
+ * below silently drops them rather than letting them steal a slot from
+ * whatever a test actually asked to observe.
+ */
+const BOOTSTRAP_MESSAGE_TYPES = new Set(['session-active', 'daemon-restored']);
+
+function isBootstrapMessage(message: Record<string, unknown>): boolean {
+  return BOOTSTRAP_MESSAGE_TYPES.has(message['type'] as string);
+}
+
 async function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
-  const [data] = (await once(ws, 'message')) as [WebSocket.RawData];
-  return rawDataToJson(data);
+  for (;;) {
+    const [data] = (await once(ws, 'message')) as [WebSocket.RawData];
+    const message = rawDataToJson(data);
+    if (!isBootstrapMessage(message)) {
+      return message;
+    }
+  }
 }
 
 async function waitForMessages(
@@ -91,7 +125,11 @@ async function waitForMessages(
     }, timeoutMs);
 
     function onMessage(data: WebSocket.RawData) {
-      messages.push(rawDataToJson(data));
+      const message = rawDataToJson(data);
+      if (isBootstrapMessage(message)) {
+        return;
+      }
+      messages.push(message);
       if (messages.length === count) {
         clearTimeout(timer);
         ws.off('message', onMessage);
@@ -3092,7 +3130,10 @@ describe('T030: End-to-end streaming integration', () => {
       const spurious = await new Promise<Array<Record<string, unknown>>>((resolve) => {
         const msgs: Array<Record<string, unknown>> = [];
         const onMsg = (data: WebSocket.RawData) => {
-          msgs.push(rawDataToJson(data));
+          const message = rawDataToJson(data);
+          if (!isBootstrapMessage(message)) {
+            msgs.push(message);
+          }
         };
         tabB.on('message', onMsg);
         setTimeout(() => {
@@ -3540,8 +3581,12 @@ describe('T030: End-to-end streaming integration', () => {
         }, 5000);
 
         function onMessage(data: WebSocket.RawData) {
+          const message = rawDataToJson(data);
+          if (isBootstrapMessage(message)) {
+            return;
+          }
           arrivalTimestamps.push(Date.now());
-          messages.push(rawDataToJson(data));
+          messages.push(message);
           if (messages.length === eventCount) {
             clearTimeout(timer);
             ws.off('message', onMessage);
@@ -3644,8 +3689,12 @@ describe('T030: End-to-end streaming integration', () => {
         }, 5000);
 
         function onMessage(data: WebSocket.RawData) {
+          const message = rawDataToJson(data);
+          if (isBootstrapMessage(message)) {
+            return;
+          }
           arrivalTimestamps.push(Date.now());
-          messages.push(rawDataToJson(data));
+          messages.push(message);
           if (messages.length === burstSize) {
             clearTimeout(timer);
             ws.off('message', onMessage);
@@ -3716,7 +3765,11 @@ describe('T030: End-to-end streaming integration', () => {
           }, 5000);
 
           function onMessage(data: WebSocket.RawData) {
-            preDisconnectMessages.push(rawDataToJson(data));
+            const message = rawDataToJson(data);
+            if (isBootstrapMessage(message)) {
+              return;
+            }
+            preDisconnectMessages.push(message);
             if (preDisconnectMessages.length === disconnectAfter) {
               clearTimeout(timer);
               ws1.off('message', onMessage);
