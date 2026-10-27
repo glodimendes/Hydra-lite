@@ -637,6 +637,7 @@ function mutateTaskUpdate(
       existing.verification = body['verification'] as TaskEntry['verification'];
     }
     if (body['commitSha'] !== undefined) existing.commitSha = body['commitSha'] as string;
+    if (body['usage'] !== undefined) existing.usage = body['usage'] as TaskEntry['usage'];
     if (body['attempts'] !== undefined) existing.attempts = Number(body['attempts']);
     if (body['priority'] !== undefined) existing.priority = Number(body['priority']);
     existing.updatedAt = nowIso();

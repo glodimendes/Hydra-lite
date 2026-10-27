@@ -2,21 +2,28 @@
  * Hydra Lite chat console — Claude Code session plumbing.
  *
  * Mirrors lib/hydra-lite-codex-session.ts's shape (`runAsk`/`runEdit`,
- * pure argv-builders, resume-by-id) so lib/hydra-lite-run-edit.ts can
- * dispatch to either module through the same interface. The two CLIs
- * differ in how they're invoked, so this is a parallel implementation,
- * not a shared base class:
+ * pure argv-builders, resume-by-id, incremental progress streaming) so
+ * lib/hydra-lite-run-edit.ts can dispatch to either module through the
+ * same interface. The two CLIs differ in how they're invoked, so this is
+ * a parallel implementation, not a shared base class:
  *
- * - Codex's `exec --json` prints one JSONL event per line; Claude Code's
- *   `-p --output-format json` prints exactly one JSON object for the whole
- *   run (confirmed hands-on: even an error — e.g. an expired OAuth
- *   session — comes back as a well-formed object with `is_error: true`
- *   and the message in `result`, exit code nonzero). So this module parses
- *   that single object rather than reusing Codex's JSONL parser, and never
- *   rejects on exit code alone — `is_error` is the actual signal.
+ * - `--output-format stream-json` (with `--verbose`, which Claude Code
+ *   requires alongside it in print mode) prints one JSON object per line
+ *   as the run happens — an `assistant` message per completed step, then
+ *   a final `result` object with `is_error`/`result`/`session_id`/`usage`/
+ *   `total_cost_usd` — mirroring Codex's JSONL shape closely enough that
+ *   this module parses it the same way (parseJsonlEvents, take the last
+ *   `result` event), rather than parsing one whole-stdout JSON object the
+ *   way an earlier version of this module did against plain
+ *   `--output-format json`.
+ * - Never rejects on exit code alone: Claude Code reports failure (e.g.
+ *   an expired OAuth session — confirmed hands-on against plain
+ *   `--output-format json`, before this module switched to stream-json)
+ *   as `is_error: true` inside a well-formed result object, not by
+ *   omitting output.
  * - Claude Code resumes a session with `-r <sessionId>` (or `--resume`);
- *   unlike Codex's `exec resume`, cwd is passed as the resumed thread's
- *   project root is already fixed by the session's own working directory.
+ *   unlike Codex's `exec resume`, cwd isn't re-specified — it's the
+ *   spawned process's own cwd, same as a fresh run.
  * - Read-only Q&A uses `--permission-mode plan`: Claude can read/search
  *   the project but any tool call that would change it is held back,
  *   mirroring Codex's `-s read-only` sandbox (process-level there,
@@ -28,15 +35,21 @@
  *   same way Codex's `-s workspace-write` is, since neither flag widens
  *   tool access beyond the working directory.
  *
- * NEEDS LIVE VERIFICATION before this module is trusted: written against
- * `claude --help` only, blocked on the installed `claude` CLI's own OAuth
- * session being expired (unrelated to Hydra Lite — fix with a normal
+ * NEEDS LIVE VERIFICATION before this module is trusted: the stream-json
+ * shape above is written from documented CLI behavior, not a captured
+ * real run — blocked on the installed `claude` CLI's own OAuth session
+ * being expired/unrefreshable (unrelated to Hydra Lite; fix with a normal
  * `claude` login). In particular: whether `-r` accepts a fresh
- * `--permission-mode` on resume, and whether `plan` mode answers a plain
- * question instead of only ever proposing a plan.
+ * `--permission-mode` on resume, whether `plan` mode answers a plain
+ * question instead of only ever proposing a plan, and whether a
+ * stream-json run's error path still ends in one `result` event the same
+ * way a successful one does. parseResult's fallback (re-parsing the whole
+ * trimmed stdout as a single JSON object when no JSONL `result` event is
+ * found) exists specifically to hedge against that last unknown.
  */
 
 import { spawn } from 'node:child_process';
+import type { TaskUsage } from './types.ts';
 
 /** Start a new, read-only Claude session. Always `--permission-mode plan`
  * — the whole safety guarantee for chat Q&A rests on this, same role as
@@ -44,14 +57,27 @@ import { spawn } from 'node:child_process';
  * here: Claude Code takes its project root from the spawned process's own
  * cwd, which the caller (runAsk) sets via spawnAndCollect. */
 export function buildAskArgs(prompt: string): [string, string[]] {
-  return ['claude', ['-p', prompt, '--output-format', 'json', '--permission-mode', 'plan']];
+  return [
+    'claude',
+    ['-p', prompt, '--output-format', 'stream-json', '--verbose', '--permission-mode', 'plan'],
+  ];
 }
 
 /** Continue an existing read-only session. */
 export function buildAskResumeArgs(sessionId: string, prompt: string): [string, string[]] {
   return [
     'claude',
-    ['-p', prompt, '--output-format', 'json', '--permission-mode', 'plan', '-r', sessionId],
+    [
+      '-p',
+      prompt,
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--permission-mode',
+      'plan',
+      '-r',
+      sessionId,
+    ],
   ];
 }
 
@@ -66,7 +92,8 @@ export function buildEditArgs(prompt: string): [string, string[]] {
       '-p',
       prompt,
       '--output-format',
-      'json',
+      'stream-json',
+      '--verbose',
       '--permission-mode',
       'acceptEdits',
       '--permission-prompts',
@@ -83,7 +110,8 @@ export function buildEditResumeArgs(sessionId: string, prompt: string): [string,
       '-p',
       prompt,
       '--output-format',
-      'json',
+      'stream-json',
+      '--verbose',
       '--permission-mode',
       'acceptEdits',
       '--permission-prompts',
@@ -94,42 +122,150 @@ export function buildEditResumeArgs(sessionId: string, prompt: string): [string,
   ];
 }
 
-interface ClaudeResultJson {
-  type?: string;
+interface ResultEvent {
+  type: 'result';
   subtype?: string;
   is_error?: boolean;
   result?: string;
   session_id?: string;
+  total_cost_usd?: number;
+  usage?: {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number;
+  };
 }
 
-export function parseResultJson(stdout: string): ClaudeResultJson | null {
+function isResultEvent(event: unknown): event is ResultEvent {
+  return (
+    event != null &&
+    typeof event === 'object' &&
+    (event as Record<string, unknown>)['type'] === 'result'
+  );
+}
+
+function parseJsonlEvents(output: string): unknown[] {
+  const events: unknown[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    if (line.trim() === '') continue;
+    try {
+      events.push(JSON.parse(line));
+    } catch {
+      /* non-JSON noise — skip */
+    }
+  }
+  return events;
+}
+
+/** Extract the run's final result object: the last JSONL `result` event,
+ * or — hedging against stream-json's error path not matching the
+ * documented shape, unverified — the whole trimmed stdout parsed as one
+ * JSON object, if that itself looks like a result. */
+function parseResult(output: string): ResultEvent | null {
+  const events = parseJsonlEvents(output).filter(isResultEvent);
+  const last = events.at(-1);
+  if (last != null) return last;
   try {
-    return JSON.parse(stdout.trim()) as ClaudeResultJson;
+    const whole: unknown = JSON.parse(output.trim());
+    return isResultEvent(whole) ? whole : null;
   } catch {
     return null;
   }
 }
 
+/** Extract token usage (and dollar cost, which Claude reports and Codex
+ * doesn't) from the run's result object. `durationMs` isn't part of
+ * this — the caller measures real wall-clock time around the spawn. */
+export function parseUsage(output: string): Omit<TaskUsage, 'durationMs'> | null {
+  const result = parseResult(output);
+  if (result?.usage == null) return null;
+  return {
+    inputTokens: result.usage.input_tokens ?? 0,
+    outputTokens: result.usage.output_tokens ?? 0,
+    cachedInputTokens: result.usage.cache_read_input_tokens,
+    costUsd: result.total_cost_usd,
+  };
+}
+
+function truncateForProgressLine(text: string, max = 160): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max - 1)}…` : oneLine;
+}
+
+/**
+ * Turn one parsed JSONL event into zero or more short, human-readable
+ * progress lines, or null to skip it — the same "in-between" level of
+ * detail as hydra-lite-codex-session.ts's formatCodexProgressEvent: one
+ * line per completed step (an assistant message, a tool call), never raw
+ * per-token deltas. Only `assistant` events carry anything worth showing;
+ * `system`/`user`(tool-result)/`result` are bookkeeping the chat
+ * console's own stage lines already cover.
+ */
+function formatContentBlock(block: unknown): string | null {
+  if (block == null || typeof block !== 'object') return null;
+  const b = block as Record<string, unknown>;
+  if (b['type'] === 'text' && typeof b['text'] === 'string' && b['text'].trim() !== '') {
+    return `    · ${truncateForProgressLine(b['text'])}`;
+  }
+  if (b['type'] === 'tool_use' && typeof b['name'] === 'string') {
+    return `    · ${b['name']}`;
+  }
+  return null;
+}
+
+export function formatClaudeProgressEvent(event: unknown): string | null {
+  if (event == null || typeof event !== 'object') return null;
+  const record = event as Record<string, unknown>;
+  if (record['type'] !== 'assistant') return null;
+  const message = record['message'];
+  if (message == null || typeof message !== 'object') return null;
+  const content = (message as Record<string, unknown>)['content'];
+  if (!Array.isArray(content)) return null;
+  const lines = content.map(formatContentBlock).filter((line): line is string => line != null);
+  return lines.length === 0 ? null : lines.join('\n');
+}
+
+/** Parse one raw stdout line as a JSONL event and forward it to
+ * `onProgress` as formatted line(s), skipping non-JSON noise and any
+ * event with nothing worth showing. */
+function bridgeProgress(onProgress: (line: string) => void): (raw: string) => void {
+  return (raw: string) => {
+    if (raw.trim() === '') return;
+    let event: unknown;
+    try {
+      event = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const line = formatClaudeProgressEvent(event);
+    if (line != null) onProgress(line);
+  };
+}
+
 /**
  * Spawn `cmd`/`args` and collect its output, resolving regardless of exit
- * code — Claude Code's `--output-format json` reports failure (e.g. an
- * expired OAuth session) as `is_error: true` inside a well-formed JSON
- * object on stdout, not by omitting output, so the caller decides success
- * from that object instead of from the process exit code. When `timeoutMs`
- * is given, a still-running child is killed (SIGTERM, then SIGKILL after
- * 5s) and the promise rejects, same bound as hydra-lite-codex-session.ts.
+ * code — Claude Code reports failure (e.g. an expired OAuth session)
+ * inside a well-formed result object on stdout, not by omitting output,
+ * so the caller decides success from that object instead of from the
+ * process exit code. When `onLine` is given, it's called with each
+ * complete stdout line as it arrives, same streaming behavior as
+ * hydra-lite-codex-session.ts's spawnAndCollect. When `timeoutMs` is
+ * given, a still-running child is killed (SIGTERM, then SIGKILL after
+ * 5s) and the promise rejects.
  */
 function spawnAndCollect(
   cmd: string,
   args: string[],
   cwd: string,
   timeoutMs?: number,
+  onLine?: (line: string) => void,
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let lineBuffer = '';
     const timer =
       timeoutMs == null
         ? null
@@ -140,6 +276,11 @@ function spawnAndCollect(
           }, timeoutMs);
     child.stdout.setEncoding('utf8').on('data', (chunk: string) => {
       stdout += chunk;
+      if (onLine == null) return;
+      lineBuffer += chunk;
+      const lines = lineBuffer.split('\n');
+      lineBuffer = lines.pop() ?? '';
+      for (const line of lines) onLine(line);
     });
     child.stderr.setEncoding('utf8').on('data', (chunk: string) => {
       stderr += chunk;
@@ -150,6 +291,7 @@ function spawnAndCollect(
     });
     child.on('close', () => {
       if (timer != null) clearTimeout(timer);
+      if (onLine != null && lineBuffer.trim() !== '') onLine(lineBuffer);
       if (timedOut) {
         reject(new Error(`claude timed out after ${String(timeoutMs)}ms and was killed`));
         return;
@@ -166,38 +308,56 @@ function spawnAndCollect(
 export interface AskResult {
   threadId: string;
   answer: string;
+  usage?: TaskUsage;
 }
 
 /**
  * Ask Claude a read-only question in `projectRoot`, continuing
  * `existingThreadId` if one is already open for this project, or starting
  * a fresh one otherwise. `threadId` here is Claude Code's own session id.
+ * `onProgress`, when given, is called with a short line for each
+ * completed step while Claude is still running.
  */
 export async function runAsk(
   projectRoot: string,
   prompt: string,
   existingThreadId?: string,
+  onProgress?: (line: string) => void,
 ): Promise<AskResult> {
   const [cmd, args] =
     existingThreadId == null ? buildAskArgs(prompt) : buildAskResumeArgs(existingThreadId, prompt);
-  const output = await spawnAndCollect(cmd, args, projectRoot);
-  const parsed = parseResultJson(output);
-  if (parsed == null) {
-    throw new Error(`claude returned non-JSON output: ${output.slice(0, 500)}`);
+  const startedAt = Date.now();
+  const output = await spawnAndCollect(
+    cmd,
+    args,
+    projectRoot,
+    undefined,
+    onProgress == null ? undefined : bridgeProgress(onProgress),
+  );
+  const durationMs = Date.now() - startedAt;
+  const result = parseResult(output);
+  if (result == null) {
+    throw new Error(`claude returned no result object: ${output.slice(0, 500)}`);
   }
-  if (parsed.is_error === true || parsed.result == null) {
-    throw new Error(parsed.result ?? 'claude reported an error with no message.');
+  if (result.is_error === true || result.result == null) {
+    throw new Error(result.result ?? 'claude reported an error with no message.');
   }
-  const threadId = existingThreadId ?? parsed.session_id;
+  const threadId = existingThreadId ?? result.session_id;
   if (threadId == null) {
     throw new Error('Claude did not report a session id for this session.');
   }
-  return { threadId, answer: parsed.result };
+  const rawUsage = parseUsage(output);
+  return {
+    threadId,
+    answer: result.result,
+    usage: rawUsage == null ? undefined : { ...rawUsage, durationMs },
+  };
 }
 
 export interface EditResult {
   threadId: string;
   summary: string;
+  usage?: TaskUsage;
 }
 
 /**
@@ -208,28 +368,44 @@ export interface EditResult {
  * precondition, verification, and the scoped commit — this function only
  * invokes Claude. `timeoutMs`, when given, kills the process if it hasn't
  * finished in time (see spawnAndCollect) rather than letting it hang.
+ * `onProgress`, when given, is called with a short line for each
+ * completed step while Claude is still running.
  */
 export async function runEdit(
   projectRoot: string,
   prompt: string,
   existingThreadId?: string,
   timeoutMs?: number,
+  onProgress?: (line: string) => void,
 ): Promise<EditResult> {
   const [cmd, args] =
     existingThreadId == null
       ? buildEditArgs(prompt)
       : buildEditResumeArgs(existingThreadId, prompt);
-  const output = await spawnAndCollect(cmd, args, projectRoot, timeoutMs);
-  const parsed = parseResultJson(output);
-  if (parsed == null) {
-    throw new Error(`claude returned non-JSON output: ${output.slice(0, 500)}`);
+  const startedAt = Date.now();
+  const output = await spawnAndCollect(
+    cmd,
+    args,
+    projectRoot,
+    timeoutMs,
+    onProgress == null ? undefined : bridgeProgress(onProgress),
+  );
+  const durationMs = Date.now() - startedAt;
+  const result = parseResult(output);
+  if (result == null) {
+    throw new Error(`claude returned no result object: ${output.slice(0, 500)}`);
   }
-  if (parsed.is_error === true || parsed.result == null) {
-    throw new Error(parsed.result ?? 'claude reported an error with no message.');
+  if (result.is_error === true || result.result == null) {
+    throw new Error(result.result ?? 'claude reported an error with no message.');
   }
-  const threadId = existingThreadId ?? parsed.session_id;
+  const threadId = existingThreadId ?? result.session_id;
   if (threadId == null) {
     throw new Error('Claude did not report a session id for this session.');
   }
-  return { threadId, summary: parsed.result };
+  const rawUsage = parseUsage(output);
+  return {
+    threadId,
+    summary: result.result,
+    usage: rawUsage == null ? undefined : { ...rawUsage, durationMs },
+  };
 }

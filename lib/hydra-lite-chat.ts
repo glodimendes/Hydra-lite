@@ -30,6 +30,10 @@
  *                               retry (resuming the same thread with the
  *                               failure as feedback) up to maxAttempts
  *                               (default 2) before blocking
+ *   /status                    — list the current project's tasks: goal,
+ *                               status, intended agent, last update
+ *   /usage                     — cumulative token/cost usage for the
+ *                               current project, overall and per agent
  *   /quit                      — exit
  * Bare text (no leading /) is an implicit question: a read-only call to
  * the active `/agent`, resumed across turns within one project+agent pair
@@ -38,11 +42,29 @@
  * session; a /run retry resumes that session, never a read-only
  * ask-thread) and never across an agent switch (each agent's CLI session
  * ids aren't interchangeable with another's).
+ *
+ * The prompt is always there to type into, including while /run or a
+ * bare-text question is still working — it just turns a different color
+ * (WARNING) for that window, back to normal (ACCENT) once it's done, so
+ * "something's running" is visible without ever blocking input. Anything
+ * printed during that window (the agent's own progress lines, the usage
+ * ticker) goes through printLine rather than a bare console.log, so it
+ * can't clobber whatever you're mid-typing into the prompt — see
+ * redrawPrompt/printLine/setBusy below.
  */
 
 import readline from 'node:readline';
 import pc from 'picocolors';
-import { ACCENT, DIM, ERROR, SUCCESS, hydraLogoCompact, divider } from './hydra-ui.ts';
+import {
+  ACCENT,
+  DIM,
+  ERROR,
+  SUCCESS,
+  WARNING,
+  hydraLogoCompact,
+  divider,
+  relativeTime,
+} from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import {
   listProjects,
@@ -64,11 +86,16 @@ import {
   resolveTaskAgent,
   parseMaxAttempts,
   type HydraLiteAgent,
+  type LogFn,
 } from './hydra-lite-run-edit.ts';
+import { summarizeUsage, formatUsageSummary } from './hydra-lite-usage.ts';
 import type { HydraStateShape } from './types.ts';
 
 const DEFAULT_URL = process.env['AI_ORCH_URL'] ?? 'http://127.0.0.1:4173';
 const KNOWN_AGENTS: readonly HydraLiteAgent[] = ['codex', 'claude', 'gemini'];
+/** How often the background usage ticker fires while the console sits
+ * idle — overridable with `url=... --usage-interval-minutes=N`. */
+const DEFAULT_USAGE_INTERVAL_MINUTES = 15;
 
 interface ConsoleState {
   baseUrl: string;
@@ -78,6 +105,11 @@ interface ConsoleState {
    * valid to resume with another, so switching /agent must never reuse an
    * old thread. */
   threadIds: Map<string, string>;
+  /** True while /run or a bare-text ask has a CLI invocation in flight —
+   * drives the prompt's color (see buildPrompt) and nothing else; the
+   * REPL still queues and runs whatever's typed next exactly as before. */
+  busy: boolean;
+  rl: readline.Interface;
 }
 
 function threadKey(state: ConsoleState, projectId: string): string {
@@ -85,16 +117,18 @@ function threadKey(state: ConsoleState, projectId: string): string {
 }
 
 /** Ask the active agent a read-only question. Each CLI's session module
- * mirrors the same `runAsk(projectRoot, prompt, existingThreadId?)` shape
- * (lib/hydra-lite-codex-session.ts / hydra-lite-claude-session.ts). */
+ * mirrors the same `runAsk(projectRoot, prompt, existingThreadId?,
+ * onProgress?)` shape (lib/hydra-lite-codex-session.ts /
+ * hydra-lite-claude-session.ts). */
 function askActiveAgent(
   agent: HydraLiteAgent,
   projectRoot: string,
   prompt: string,
   existingThreadId: string | undefined,
+  onProgress: LogFn,
 ): ReturnType<typeof runCodexAsk> {
-  if (agent === 'codex') return runCodexAsk(projectRoot, prompt, existingThreadId);
-  if (agent === 'claude') return runClaudeAsk(projectRoot, prompt, existingThreadId);
+  if (agent === 'codex') return runCodexAsk(projectRoot, prompt, existingThreadId, onProgress);
+  if (agent === 'claude') return runClaudeAsk(projectRoot, prompt, existingThreadId, onProgress);
   throw new Error(`Gemini CLI support is not implemented yet (agent "${agent}").`);
 }
 
@@ -125,6 +159,10 @@ function printWelcome(): void {
   console.log(
     `  ${ACCENT('/run <taskId> [maxAttempts]')}  Execute an approved edit, retrying on verify failure`,
   );
+  console.log(`  ${ACCENT('/status')}                  List this project's tasks and their agent`);
+  console.log(
+    `  ${ACCENT('/usage')}                   Cumulative token/cost usage for this project`,
+  );
   console.log(`  ${ACCENT('/quit')}                    Exit`);
   console.log(
     DIM('  Anything else is a question for the active /agent about the current project.'),
@@ -134,9 +172,39 @@ function printWelcome(): void {
 
 function buildPrompt(state: ConsoleState): string {
   const label = state.currentProject ? state.currentProject.name : DIM('no project');
+  const color = state.busy ? WARNING : ACCENT;
   return stripAnsiForReadlineWidth(
-    `${ACCENT('hydra-lite')}${DIM('[')}${state.currentAgent}${DIM('](')}${label}${DIM(')>')} `,
+    `${color('hydra-lite')}${DIM('[')}${state.currentAgent}${DIM('](')}${label}${DIM(')>')} `,
   );
+}
+
+/** Redraw the prompt with the current busy/idle color, preserving
+ * whatever the user has already typed (`preserveCursor`) — the prompt is
+ * always there to type into, so this never clears their in-progress
+ * line, just repaints it. Call it whenever `state.busy` changes or right
+ * after printLine prints something above it. */
+function redrawPrompt(state: ConsoleState): void {
+  state.rl.setPrompt(buildPrompt(state));
+  state.rl.prompt(true);
+}
+
+/** Print a line without clobbering whatever the user is mid-typing into
+ * the active prompt: clear the current input row, write the line above
+ * it, then redraw the prompt (and the user's buffered text) beneath it.
+ * Use this instead of a bare console.log for anything printed while a
+ * command may still be running — an agent's progress line, the usage
+ * ticker — since a plain console.log there would overwrite the prompt
+ * row instead of scrolling above it. */
+function printLine(state: ConsoleState, text: string): void {
+  readline.clearLine(process.stdout, 0);
+  readline.cursorTo(process.stdout, 0);
+  console.log(text);
+  redrawPrompt(state);
+}
+
+function setBusy(state: ConsoleState, busy: boolean): void {
+  state.busy = busy;
+  redrawPrompt(state);
 }
 
 /** Show, or switch, the chat console's one global active-agent setting.
@@ -370,7 +438,23 @@ async function dispatchRunCommand(state: ConsoleState, rawArgs: string): Promise
   const agent = resolveTaskAgent(task);
   if (!(await claimTask(baseUrl, project, taskId, agent))) return;
 
-  await runEditWithRetries(baseUrl, project, taskId, task, agent, maxAttempts);
+  setBusy(state, true);
+  try {
+    await runEditWithRetries(
+      baseUrl,
+      project,
+      taskId,
+      task,
+      agent,
+      maxAttempts,
+      undefined,
+      (line) => {
+        printLine(state, line);
+      },
+    );
+  } finally {
+    setBusy(state, false);
+  }
 }
 
 async function dispatchAsk(state: ConsoleState, question: string): Promise<void> {
@@ -380,15 +464,75 @@ async function dispatchAsk(state: ConsoleState, question: string): Promise<void>
   }
   const key = threadKey(state, state.currentProject.id);
   const existingThreadId = state.threadIds.get(key);
-  const { threadId, answer } = await askActiveAgent(
-    state.currentAgent,
-    state.currentProject.path,
-    question,
-    existingThreadId,
-  );
-  state.threadIds.set(key, threadId);
-  console.log(`  ${answer}`);
+  setBusy(state, true);
+  try {
+    const { threadId, answer } = await askActiveAgent(
+      state.currentAgent,
+      state.currentProject.path,
+      question,
+      existingThreadId,
+      (line) => {
+        printLine(state, line);
+      },
+    );
+    state.threadIds.set(key, threadId);
+    printLine(state, `  ${answer}`);
+  } finally {
+    setBusy(state, false);
+  }
 }
+
+/** List the current project's tasks: id, status, intended agent, goal
+ * (title), and how long since it last changed — the "what are agents
+ * doing/controlled/launched for" view. Read-only, fast (one GET /state),
+ * so unlike /run and bare-text ask it never toggles busy. */
+async function dispatchStatusCommand(state: ConsoleState): Promise<void> {
+  if (!state.currentProject) {
+    console.log(ERROR('  No current project — run /project use <name|id> first.'));
+    return;
+  }
+  const { state: projectState } = await request<{ state: HydraStateShape }>(
+    'GET',
+    state.baseUrl,
+    `/state?projectId=${state.currentProject.id}`,
+  );
+  const tasks = projectState.tasks;
+  if (tasks.length === 0) {
+    console.log(DIM('  No tasks yet in this project.'));
+    return;
+  }
+  for (const task of tasks) {
+    const agent = task.effect === 'edit' ? resolveTaskAgent(task) : '-';
+    const goal = task.title === '' ? task.notes : task.title;
+    console.log(
+      `  ${pc.bold(task.id)} ${DIM(`[${task.status}]`)} ${ACCENT(agent)} ${goal} ${DIM(`(${relativeTime(task.updatedAt)})`)}`,
+    );
+  }
+}
+
+/** Cumulative token/cost usage for the current project, overall and per
+ * agent — sums the `usage` field Hydra Lite stamps onto finished edit
+ * tasks (lib/hydra-lite-run-edit.ts), straight off GET /state. */
+async function dispatchUsageCommand(state: ConsoleState): Promise<void> {
+  if (!state.currentProject) {
+    console.log(ERROR('  No current project — run /project use <name|id> first.'));
+    return;
+  }
+  const { state: projectState } = await request<{ state: HydraStateShape }>(
+    'GET',
+    state.baseUrl,
+    `/state?projectId=${state.currentProject.id}`,
+  );
+  console.log(formatUsageSummary(summarizeUsage(projectState.tasks)));
+}
+
+/** Commands that take no arguments — checked by exact match before the
+ * prefix-based commands below, mainly to keep dispatchLine's branch count
+ * under the project's complexity limit as new no-arg commands are added. */
+const ZERO_ARG_COMMANDS: Readonly<Record<string, (state: ConsoleState) => void | Promise<void>>> = {
+  '/status': dispatchStatusCommand,
+  '/usage': dispatchUsageCommand,
+};
 
 async function dispatchLine(state: ConsoleState, line: string): Promise<boolean> {
   const trimmed = line.trim();
@@ -396,6 +540,10 @@ async function dispatchLine(state: ConsoleState, line: string): Promise<boolean>
   if (trimmed === '/quit' || trimmed === '/exit') return false;
   if (trimmed === '/help') {
     printWelcome();
+    return true;
+  }
+  if (Object.hasOwn(ZERO_ARG_COMMANDS, trimmed)) {
+    await ZERO_ARG_COMMANDS[trimmed](state);
     return true;
   }
   if (trimmed === '/agent' || trimmed.startsWith('/agent ')) {
@@ -430,14 +578,33 @@ async function dispatchLine(state: ConsoleState, line: string): Promise<boolean>
   return true;
 }
 
+function parseUsageIntervalMinutes(argv: string[]): number {
+  const arg = argv.find((a) => a.startsWith('--usage-interval-minutes='));
+  if (arg == null) return DEFAULT_USAGE_INTERVAL_MINUTES;
+  const value = Number.parseInt(arg.slice('--usage-interval-minutes='.length), 10);
+  return Number.isFinite(value) && value > 0 ? value : DEFAULT_USAGE_INTERVAL_MINUTES;
+}
+
+/** Print an unprompted usage summary for the current project, same
+ * formatting as /usage — the background ticker's one job. No-ops with no
+ * current project, since there's nothing to summarize yet. */
+async function tickUsage(state: ConsoleState): Promise<void> {
+  if (!state.currentProject) return;
+  try {
+    const { state: projectState } = await request<{ state: HydraStateShape }>(
+      'GET',
+      state.baseUrl,
+      `/state?projectId=${state.currentProject.id}`,
+    );
+    printLine(state, formatUsageSummary(summarizeUsage(projectState.tasks)));
+  } catch {
+    /* the daemon may be mid-restart — skip silently, next tick will catch up */
+  }
+}
+
 function main(): void {
-  const urlArg = process.argv.slice(2).find((arg) => arg.startsWith('url='));
-  const state: ConsoleState = {
-    baseUrl: urlArg == null ? DEFAULT_URL : urlArg.slice('url='.length),
-    currentProject: null,
-    currentAgent: 'codex',
-    threadIds: new Map(),
-  };
+  const argv = process.argv.slice(2);
+  const urlArg = argv.find((arg) => arg.startsWith('url='));
 
   printWelcome();
   console.log(divider());
@@ -446,9 +613,24 @@ function main(): void {
     input: process.stdin,
     output: process.stdout,
     terminal: true,
-    prompt: buildPrompt(state),
+    prompt: '',
   });
-  rl.prompt();
+  const state: ConsoleState = {
+    baseUrl: urlArg == null ? DEFAULT_URL : urlArg.slice('url='.length),
+    currentProject: null,
+    currentAgent: 'codex',
+    threadIds: new Map(),
+    busy: false,
+    rl,
+  };
+  redrawPrompt(state);
+
+  const usageIntervalMs = parseUsageIntervalMinutes(argv) * 60_000;
+  const ticker = setInterval(() => {
+    tickUsage(state).catch(() => {
+      /* tickUsage already swallows its own errors; this is belt-and-suspenders */
+    });
+  }, usageIntervalMs);
 
   // Serialize line dispatch: readline's 'line' event fires for every
   // buffered line immediately, without waiting for a prior async handler
@@ -473,14 +655,14 @@ function main(): void {
         return;
       }
       if (!closed) {
-        rl.setPrompt(buildPrompt(state));
-        rl.prompt();
+        redrawPrompt(state);
       }
     });
   });
 
   rl.on('close', () => {
     closed = true;
+    clearInterval(ticker);
     console.log(DIM('\n  Goodbye.'));
     process.exitCode = 0;
   });

@@ -29,12 +29,20 @@ import {
 } from './hydra-lite-git.ts';
 import { resolveProjectVerificationPlan } from './hydra-lite-project-config.ts';
 import type { RegisteredProject } from './hydra-registry.ts';
-import type { HydraStateShape, TaskEntry } from './types.ts';
+import type { HydraStateShape, TaskEntry, TaskUsage } from './types.ts';
 
 /** The runtime agents `/run` (and the worker) can dispatch an edit attempt
  * to. Kept in sync with types.ts's `TaskEntry['intendedAgent']` and the
  * daemon's `KNOWN_INTENDED_AGENTS` (lib/daemon/write-routes.ts). */
 export type HydraLiteAgent = 'codex' | 'claude' | 'gemini';
+
+/** A single line of output. Every status/progress line in this module
+ * goes through a `log` of this shape instead of a bare `console.log`, so
+ * the chat console can redraw-safely interleave them with its own
+ * readline prompt (see hydra-lite-chat.ts's printLine) while a run is in
+ * flight; the worker (no readline involved) just defaults it to
+ * `console.log`. */
+export type LogFn = (line: string) => void;
 
 /** A task queued before multi-CLI support (or a read task, which never
  * carries `intendedAgent`) always executes under Codex — the only agent
@@ -45,20 +53,25 @@ export function resolveTaskAgent(task: TaskEntry): HydraLiteAgent {
 
 /** Dispatch one edit attempt to the agent's own session module. Each
  * module mirrors hydra-lite-codex-session.ts's `runEdit(projectRoot,
- * prompt, existingThreadId?, timeoutMs?)` shape, so adding a fourth agent
- * here is a one-line addition, not a redesign. Gemini CLI isn't installed
- * on the development machine yet, so it's typed and routed but not wired
- * to a real session module — selecting it fails loudly instead of silently
- * falling back to a different CLI. */
+ * prompt, existingThreadId?, timeoutMs?, onProgress?)` shape, so adding a
+ * fourth agent here is a one-line addition, not a redesign. Gemini CLI
+ * isn't installed on the development machine yet, so it's typed and
+ * routed but not wired to a real session module — selecting it fails
+ * loudly instead of silently falling back to a different CLI. */
 function runEditFor(
   agent: HydraLiteAgent,
   projectRoot: string,
   prompt: string,
   existingThreadId: string | undefined,
   timeoutMs: number | undefined,
+  onProgress: LogFn,
 ): ReturnType<typeof runCodexEdit> {
-  if (agent === 'codex') return runCodexEdit(projectRoot, prompt, existingThreadId, timeoutMs);
-  if (agent === 'claude') return runClaudeEdit(projectRoot, prompt, existingThreadId, timeoutMs);
+  if (agent === 'codex') {
+    return runCodexEdit(projectRoot, prompt, existingThreadId, timeoutMs, onProgress);
+  }
+  if (agent === 'claude') {
+    return runClaudeEdit(projectRoot, prompt, existingThreadId, timeoutMs, onProgress);
+  }
   throw new Error(`Gemini CLI support is not implemented yet (agent "${agent}").`);
 }
 
@@ -109,6 +122,7 @@ export async function markBlocked(
   note: string,
   attempts: number,
   verification?: TaskEntry['verification'],
+  usage?: TaskUsage,
 ): Promise<void> {
   await request('POST', baseUrl, `/task/update?projectId=${projectId}`, {
     taskId,
@@ -116,6 +130,7 @@ export async function markBlocked(
     notes: note,
     verification,
     attempts,
+    usage,
     verify: false,
   });
 }
@@ -191,12 +206,15 @@ export interface VerifyOutcome {
 /** Run the project's verify command (if any) and just report the outcome —
  * never touches the task itself. The retry loop decides whether a failure
  * means "block" or "retry with feedback". */
-export async function runProjectVerification(project: RegisteredProject): Promise<VerifyOutcome> {
+export async function runProjectVerification(
+  project: RegisteredProject,
+  log: LogFn,
+): Promise<VerifyOutcome> {
   const plan = resolveProjectVerificationPlan(project.path);
   if (!plan.enabled) {
     return { verification: { passed: true, checkedAt: new Date().toISOString() }, output: '' };
   }
-  console.log(DIM(`  Verifying: ${plan.command}`));
+  log(DIM(`  Verifying: ${plan.command}`));
   const result = await runVerifyCommand(plan.command, project.path, plan.timeoutMs);
   return {
     verification: {
@@ -219,6 +237,8 @@ export async function commitEdit(
   changedFiles: string[],
   verification: NonNullable<TaskEntry['verification']>,
   attempts: number,
+  log: LogFn,
+  usage?: TaskUsage,
 ): Promise<void> {
   const title = task.title === '' ? taskId : task.title;
   let sha: string;
@@ -237,9 +257,10 @@ export async function commitEdit(
       `[Hydra Lite /run] Edit succeeded and verified, but committing failed: ${message}`,
       attempts,
       verification,
+      usage,
     );
-    console.log(ERROR(`  Commit failed: ${message}`));
-    console.log(
+    log(ERROR(`  Commit failed: ${message}`));
+    log(
       DIM(
         `  ${taskId} set to blocked. Changes are verified but still uncommitted at ${project.path}.`,
       ),
@@ -254,16 +275,17 @@ export async function commitEdit(
     verification,
     commitSha: sha,
     attempts,
+    usage,
     verify: false,
   });
   const fileWord = changedFiles.length === 1 ? 'file' : 'files';
-  console.log(
+  log(
     SUCCESS(
       `  ${taskId} done. Committed ${sha.slice(0, 10)} (${String(changedFiles.length)} ${fileWord}).`,
     ),
   );
   for (const file of changedFiles) {
-    console.log(DIM(`    ${file}`));
+    log(DIM(`    ${file}`));
   }
 }
 
@@ -286,6 +308,72 @@ export type AttemptOutcome =
   | { status: 'blocked' }
   | { status: 'retry'; threadId: string; failure: VerifyOutcome };
 
+/** The agent touched nothing — mark the task done with a trivial
+ * "verification", no manifest, no commit. Split out of runOneEditAttempt
+ * purely to keep that function under the project's max-lines-per-function
+ * limit; it has exactly one call site. */
+async function markNoChangesDone(
+  baseUrl: string,
+  project: RegisteredProject,
+  taskId: string,
+  agent: HydraLiteAgent,
+  attempt: number,
+  usage: TaskUsage | undefined,
+  log: LogFn,
+): Promise<void> {
+  await request('POST', baseUrl, `/task/update?projectId=${project.id}`, {
+    taskId,
+    status: 'done',
+    manifest: [],
+    verification: { passed: true, checkedAt: new Date().toISOString() },
+    attempts: attempt,
+    usage,
+    verify: false,
+  });
+  log(SUCCESS(`  ${agent} made no file changes. ${taskId} marked done.`));
+}
+
+/** Verification failed — either hand back a 'retry' outcome (more
+ * attempts left) or block the task. Split out of runOneEditAttempt purely
+ * to keep that function under the project's max-lines-per-function limit;
+ * it has exactly one call site. */
+async function handleVerificationFailure(
+  baseUrl: string,
+  project: RegisteredProject,
+  taskId: string,
+  attempt: number,
+  maxAttempts: number,
+  nextThreadId: string,
+  outcome: VerifyOutcome,
+  usage: TaskUsage | undefined,
+  log: LogFn,
+): Promise<AttemptOutcome> {
+  log(
+    ERROR(
+      `  Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
+    ),
+  );
+  if (attempt < maxAttempts) {
+    log(DIM('  Retrying with the failure as feedback...'));
+    return { status: 'retry', threadId: nextThreadId, failure: outcome };
+  }
+  await markBlocked(
+    baseUrl,
+    project.id,
+    taskId,
+    `[Hydra Lite /run] Verification failed after ${String(attempt)} attempt(s) (${outcome.verification.command ?? ''}):\n${outcome.output.slice(0, 500)}`,
+    attempt,
+    outcome.verification,
+    usage,
+  );
+  log(
+    DIM(
+      `  ${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
+    ),
+  );
+  return { status: 'blocked' };
+}
+
 /**
  * Run one Codex attempt (fresh, or resuming `threadId` with `lastFailure`
  * as feedback), then verify it. Reports and persists every outcome itself
@@ -305,9 +393,10 @@ export async function runOneEditAttempt(
   maxAttempts: number,
   threadId: string | undefined,
   lastFailure: VerifyOutcome | null,
-  timeoutMs?: number,
+  timeoutMs: number | undefined,
+  log: LogFn,
 ): Promise<AttemptOutcome> {
-  console.log(
+  log(
     DIM(`  Running ${taskId} via ${agent} (attempt ${String(attempt)}/${String(maxAttempts)})...`),
   );
   const originalPrompt = task.notes === '' ? task.title : task.notes;
@@ -315,10 +404,12 @@ export async function runOneEditAttempt(
 
   let nextThreadId: string;
   let summary: string;
+  let usage: TaskUsage | undefined;
   try {
-    const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs);
+    const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs, log);
     nextThreadId = result.threadId;
     summary = result.summary;
+    usage = result.usage;
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
     await markBlocked(
@@ -328,56 +419,46 @@ export async function runOneEditAttempt(
       `[Hydra Lite /run] ${agent} invocation failed on attempt ${String(attempt)}: ${message}`,
       attempt,
     );
-    console.log(ERROR(`  ${agent} invocation failed: ${message}`));
-    console.log(DIM(`  ${taskId} set to blocked.`));
+    log(ERROR(`  ${agent} invocation failed: ${message}`));
+    log(DIM(`  ${taskId} set to blocked.`));
     return { status: 'blocked' };
   }
-  console.log(`  ${summary}`);
+  log(`  ${summary}`);
 
   const changedFiles = listChangedFiles(project.path);
   if (changedFiles.length === 0) {
-    await request('POST', baseUrl, `/task/update?projectId=${project.id}`, {
-      taskId,
-      status: 'done',
-      manifest: [],
-      verification: { passed: true, checkedAt: new Date().toISOString() },
-      attempts: attempt,
-      verify: false,
-    });
-    console.log(SUCCESS(`  Codex made no file changes. ${taskId} marked done.`));
+    await markNoChangesDone(baseUrl, project, taskId, agent, attempt, usage, log);
     return { status: 'done' };
   }
 
-  const outcome = await runProjectVerification(project);
+  const outcome = await runProjectVerification(project, log);
   if (outcome.verification.passed) {
-    console.log(SUCCESS('  Verification passed.'));
-    await commitEdit(baseUrl, project, taskId, task, changedFiles, outcome.verification, attempt);
+    log(SUCCESS('  Verification passed.'));
+    await commitEdit(
+      baseUrl,
+      project,
+      taskId,
+      task,
+      changedFiles,
+      outcome.verification,
+      attempt,
+      log,
+      usage,
+    );
     return { status: 'done' };
   }
 
-  console.log(
-    ERROR(
-      `  Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
-    ),
-  );
-  if (attempt < maxAttempts) {
-    console.log(DIM('  Retrying with the failure as feedback...'));
-    return { status: 'retry', threadId: nextThreadId, failure: outcome };
-  }
-  await markBlocked(
+  return handleVerificationFailure(
     baseUrl,
-    project.id,
+    project,
     taskId,
-    `[Hydra Lite /run] Verification failed after ${String(attempt)} attempt(s) (${outcome.verification.command ?? ''}):\n${outcome.output.slice(0, 500)}`,
     attempt,
-    outcome.verification,
+    maxAttempts,
+    nextThreadId,
+    outcome,
+    usage,
+    log,
   );
-  console.log(
-    DIM(
-      `  ${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
-    ),
-  );
-  return { status: 'blocked' };
 }
 
 /**
@@ -396,6 +477,7 @@ export async function runEditWithRetries(
   agent: HydraLiteAgent,
   maxAttempts: number,
   timeoutMs?: number,
+  log: LogFn = console.log,
 ): Promise<'done' | 'blocked'> {
   let threadId: string | undefined;
   let lastFailure: VerifyOutcome | null = null;
@@ -413,6 +495,7 @@ export async function runEditWithRetries(
       threadId,
       lastFailure,
       timeoutMs,
+      log,
     );
     if (outcome.status !== 'retry') return outcome.status;
     threadId = outcome.threadId;

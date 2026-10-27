@@ -1,10 +1,13 @@
 /**
  * Tests for lib/hydra-lite-codex-session.ts.
  *
- * The JSONL fixtures below are literal output captured from a real
- * `codex exec ... --json` run against the installed codex-cli (0.163.0),
- * including the real "Reading additional input from stdin..." noise line
- * codex prints before the JSON stream starts.
+ * FRESH_RUN_OUTPUT/RESUME_RUN_OUTPUT are literal output captured from a
+ * real `codex exec ... --json` run against the installed codex-cli
+ * (0.163.0), including the real "Reading additional input from
+ * stdin..." noise line codex prints before the JSON stream starts. The
+ * single-line fixtures inline inside the formatCodexProgressEvent tests
+ * below are constructed to exercise item types other than agent_message
+ * (never observed live) — not captured output.
  */
 
 import { describe, it } from 'node:test';
@@ -15,6 +18,8 @@ import {
   buildEditArgs,
   parseThreadId,
   parseAgentMessage,
+  parseUsage,
+  formatCodexProgressEvent,
 } from '../lib/hydra-lite-codex-session.ts';
 
 const FRESH_RUN_OUTPUT = [
@@ -148,5 +153,56 @@ describe('parseAgentMessage', () => {
 
   it('returns null when there is no agent_message item', () => {
     assert.equal(parseAgentMessage('{"type":"turn.started"}\n'), null);
+  });
+});
+
+describe('parseUsage', () => {
+  it('extracts token usage from a real fresh-run turn.completed event', () => {
+    const usage = parseUsage(FRESH_RUN_OUTPUT);
+    assert.ok(usage != null);
+    assert.equal(usage.inputTokens, 18490);
+    assert.equal(usage.cachedInputTokens, 12160);
+    assert.equal(usage.outputTokens, 5);
+  });
+
+  it('extracts token usage from a real resume-run turn.completed event', () => {
+    const usage = parseUsage(RESUME_RUN_OUTPUT);
+    assert.ok(usage != null);
+    assert.equal(usage.inputTokens, 38385);
+    assert.equal(usage.outputTokens, 12);
+  });
+
+  it('returns null when there is no turn.completed event', () => {
+    assert.equal(parseUsage('{"type":"turn.started"}\n'), null);
+  });
+});
+
+describe('formatCodexProgressEvent', () => {
+  it('formats an agent_message item as a progress line', () => {
+    const line = formatCodexProgressEvent(
+      JSON.parse('{"type":"item.completed","item":{"type":"agent_message","text":"OK"}}'),
+    );
+    assert.match(line ?? '', /OK/);
+  });
+
+  it('formats a non-agent_message item with its type and a detail field', () => {
+    const line = formatCodexProgressEvent(
+      JSON.parse(
+        '{"type":"item.completed","item":{"type":"command_execution","command":"npm test"}}',
+      ),
+    );
+    assert.match(line ?? '', /command_execution/);
+    assert.match(line ?? '', /npm test/);
+  });
+
+  it('returns null for a non-item.completed event', () => {
+    assert.equal(formatCodexProgressEvent(JSON.parse('{"type":"turn.started"}')), null);
+  });
+
+  it('returns null for a turn.completed event', () => {
+    assert.equal(
+      formatCodexProgressEvent(JSON.parse('{"type":"turn.completed","usage":{}}')),
+      null,
+    );
   });
 });

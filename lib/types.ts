@@ -218,6 +218,26 @@ export interface HydraLiteTaskFields {
    * Default 0 when unset. Purely advisory — never affects the concurrency
    * gate or what a human can claim/run manually via the chat console. */
   priority?: number;
+  /** Token/cost/duration usage recorded from the attempt that finished
+   * this task (done or blocked) — not summed across earlier retries of
+   * the same task. Stamped by lib/hydra-lite-run-edit.ts so the chat
+   * console's /usage command and background ticker (lib/hydra-lite-usage.ts)
+   * can total it straight off GET /state instead of keeping a separate
+   * log. Absent on read tasks and on any edit task that never finished an
+   * attempt. */
+  usage?: TaskUsage;
+}
+
+/** Normalized token/cost/duration usage for one CLI invocation — the
+ * common shape hydra-lite-codex-session.ts and hydra-lite-claude-session.ts
+ * both report, regardless of how differently each CLI's own JSON reports
+ * it (Codex has no dollar cost; Claude has no reasoning-token breakdown). */
+export interface TaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  costUsd?: number;
+  durationMs: number;
 }
 
 /** Shape of a task record as stored in daemon state.tasks[] */
