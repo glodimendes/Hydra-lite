@@ -1,10 +1,13 @@
 {
   "name": "hydra",
   "version": "1.2.0",
-  "description": "Multi-agent AI orchestration system",
+  "description": "Hydra Lite for macOS — a lean, Codex-only, terminal continuation of Hydra, the multi-agent AI orchestration system",
   "type": "module",
   "license": "MIT",
   "author": "Silly Pepper",
+  "contributors": [
+    "glodimendes (https://github.com/glodimendes) — creator/continuator of Hydra Lite for macOS"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/PrimeLocus/Hydra.git"
