@@ -41,7 +41,14 @@
  * boundary (an edit's /run always starts its own fresh, write-enabled
  * session; a /run retry resumes that session, never a read-only
  * ask-thread) and never across an agent switch (each agent's CLI session
- * ids aren't interchangeable with another's).
+ * ids aren't interchangeable with another's). Right after an answer, the
+ * console suggests turning that same question into an edit task —
+ * answering "y"/"yes" queues it, approves it, and runs it in one go
+ * (still three real steps under the hood, via the same
+ * dispatchEditCommand/dispatchApproveCommand/dispatchRunCommand a manual
+ * /edit+/approve+/run would call — this just collapses the human side of
+ * it to one confirmation); anything else typed instead just dispatches
+ * normally, dropping the suggestion rather than blocking on it.
  *
  * The prompt is always there to type into, including while /run or a
  * bare-text question is still working — it just turns a different color
@@ -89,6 +96,7 @@ import {
   parseMaxAttempts,
   agentProgressLine,
   agentOutputLine,
+  hydraLine,
   type HydraLiteAgent,
   type LogFn,
 } from './hydra-lite-run-edit.ts';
@@ -123,6 +131,14 @@ interface ConsoleState {
    * interface, which throws (confirmed hands-on: `ERR_USE_AFTER_CLOSE`
    * crashed the whole process). */
   closed: boolean;
+  /** Set right after a bare-text ask prints its answer; cleared by the
+   * very next line typed, whatever it is. If that line is "y"/"yes"
+   * (case-insensitive), the ask's own question becomes an edit task
+   * that's immediately approved and run — one confirmation standing in
+   * for what would otherwise be a manual /edit, /approve, /run. Any
+   * other line (including a totally unrelated command) just drops the
+   * suggestion and dispatches normally, so it's never a modal blocker. */
+  pendingTaskSuggestion: { instructions: string } | null;
 }
 
 function threadKey(state: ConsoleState, projectId: string): string {
@@ -179,6 +195,9 @@ function printWelcome(): void {
   console.log(`  ${ACCENT('/quit')}                    Exit`);
   console.log(
     DIM('  Anything else is a question for the active /agent about the current project.'),
+  );
+  console.log(
+    DIM('  Answer "y" right after to queue, approve, and run it as an edit task instead.'),
   );
   console.log('');
 }
@@ -410,14 +429,20 @@ async function dispatchPriorityCommand(state: ConsoleState, rawArgs: string): Pr
   console.log(SUCCESS(`  ${String(task['id'])} priority is now ${String(task['priority'])}.`));
 }
 
-async function dispatchEditCommand(state: ConsoleState, instructions: string): Promise<void> {
+/** Queue an edit task. Returns its id on success (so runSuggestedTask
+ * below can chase it straight into /approve + /run), or null if nothing
+ * was queued (no current project, empty instructions). */
+async function dispatchEditCommand(
+  state: ConsoleState,
+  instructions: string,
+): Promise<string | null> {
   if (!state.currentProject) {
     console.log(ERROR('  No current project — run /project use <name|id> first.'));
-    return;
+    return null;
   }
   if (instructions.trim() === '') {
     console.log(ERROR('  Usage: /edit <instructions>'));
-    return;
+    return null;
   }
   const title = instructions.length > 60 ? `${instructions.slice(0, 57)}...` : instructions;
   const { task } = await request<{ task: Record<string, unknown> }>(
@@ -426,14 +451,14 @@ async function dispatchEditCommand(state: ConsoleState, instructions: string): P
     `/task/add?projectId=${state.currentProject.id}`,
     { title, notes: instructions, effect: 'edit', intendedAgent: state.currentAgent },
   );
+  const taskId = String(task['id']);
   console.log(
     SUCCESS(
-      `  Queued edit task ${String(task['id'])} for ${state.currentAgent} (status: ${String(task['status'])}).`,
+      `  Queued edit task ${taskId} for ${state.currentAgent} (status: ${String(task['status'])}).`,
     ),
   );
-  console.log(
-    DIM(`  Run /approve ${String(task['id'])} to unblock it — this does not execute it.`),
-  );
+  console.log(DIM(`  Run /approve ${taskId} to unblock it — this does not execute it.`));
+  return taskId;
 }
 
 async function dispatchApproveCommand(state: ConsoleState, taskId: string): Promise<void> {
@@ -524,6 +549,26 @@ async function dispatchAsk(state: ConsoleState, question: string): Promise<void>
   } finally {
     setBusy(state, false);
   }
+  state.pendingTaskSuggestion = { instructions: question };
+  printLine(state, hydraLine('Want me to create, approve, and run this as an edit task? [y/N]'));
+}
+
+/**
+ * Carry out a suggestion the user just confirmed with "y"/"yes": queue
+ * the original question as an edit task, approve it, then run it —
+ * reusing the exact same dispatch functions a manual /edit, /approve,
+ * /run would, so nothing about the approval/verify/commit pipeline
+ * changes; only the number of prompts the human has to answer does.
+ * Stops early (no approve/run) if the queue step itself failed.
+ */
+async function runSuggestedTask(
+  state: ConsoleState,
+  suggestion: { instructions: string },
+): Promise<void> {
+  const taskId = await dispatchEditCommand(state, suggestion.instructions);
+  if (taskId == null) return;
+  await dispatchApproveCommand(state, taskId);
+  await dispatchRunCommand(state, taskId);
 }
 
 /** List the current project's tasks: id, status, intended agent, goal
@@ -577,16 +622,31 @@ async function dispatchUsageCommand(state: ConsoleState): Promise<void> {
 const ZERO_ARG_COMMANDS: Readonly<Record<string, (state: ConsoleState) => void | Promise<void>>> = {
   '/status': dispatchStatusCommand,
   '/usage': dispatchUsageCommand,
+  '/help': printWelcome,
 };
+
+/** If a task suggestion is pending, consume it: run the suggested
+ * create+approve+run chain on "y"/"yes", otherwise just drop it.
+ * Returns true when that fully handled the line (an accepted
+ * suggestion) and dispatchLine should stop there; false means
+ * dispatchLine should keep going and dispatch the line normally — a
+ * decline, or no suggestion was pending in the first place. Split out
+ * of dispatchLine purely to keep that function under the project's
+ * complexity limit. */
+async function maybeHandleTaskSuggestion(state: ConsoleState, trimmed: string): Promise<boolean> {
+  const suggestion = state.pendingTaskSuggestion;
+  if (suggestion == null) return false;
+  state.pendingTaskSuggestion = null;
+  if (trimmed.toLowerCase() !== 'y' && trimmed.toLowerCase() !== 'yes') return false;
+  await runSuggestedTask(state, suggestion);
+  return true;
+}
 
 async function dispatchLine(state: ConsoleState, line: string): Promise<boolean> {
   const trimmed = line.trim();
+  if (await maybeHandleTaskSuggestion(state, trimmed)) return true;
   if (trimmed === '') return true;
   if (trimmed === '/quit' || trimmed === '/exit') return false;
-  if (trimmed === '/help') {
-    printWelcome();
-    return true;
-  }
   if (Object.hasOwn(ZERO_ARG_COMMANDS, trimmed)) {
     await ZERO_ARG_COMMANDS[trimmed](state);
     return true;
@@ -668,6 +728,7 @@ function main(): void {
     busy: false,
     rl,
     closed: false,
+    pendingTaskSuggestion: null,
   };
   redrawPrompt(state);
 
