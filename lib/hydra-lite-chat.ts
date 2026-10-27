@@ -64,7 +64,6 @@ import {
   hydraLogoCompact,
   divider,
   relativeTime,
-  getAgentColor,
 } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import { exit } from './hydra-process.ts';
@@ -183,11 +182,33 @@ function printWelcome(): void {
   console.log('');
 }
 
+/** The prompt's "hydra-lite" word: green while idle, yellow while a
+ * CLI invocation is in flight (WARNING, already pc.yellow) — both are
+ * standard ANSI hues, chosen to read clearly whether the terminal theme
+ * is light or dark (unlike, say, plain ANSI black — see PROMPT_AGENT_COLORS
+ * below for why that matters here). */
+const PROMPT_IDLE_COLOR = pc.green;
+
+/** Differentiates which CLI the prompt's `[agent]` segment names — one
+ * color per model, reused for /status's agent column too (see
+ * dispatchStatusCommand) so the same color always means the same agent
+ * everywhere in the console. Deliberately plain ANSI colors (not a
+ * custom true-color blend): green/blue/red are part of every terminal
+ * theme's base 16 and are designed to stay legible against both a dark
+ * and a light background, which a hand-picked RGB value isn't
+ * guaranteed to be. */
+const PROMPT_AGENT_COLORS: Readonly<Record<HydraLiteAgent, (s: string) => string>> = {
+  codex: pc.green,
+  gemini: pc.blue,
+  claude: pc.red,
+};
+
 function buildPrompt(state: ConsoleState): string {
   const label = state.currentProject ? state.currentProject.name : DIM('no project');
-  const color = state.busy ? WARNING : ACCENT;
+  const hydraColor = state.busy ? WARNING : PROMPT_IDLE_COLOR;
+  const agentColor = PROMPT_AGENT_COLORS[state.currentAgent];
   return stripAnsiForReadlineWidth(
-    `${color('hydra-lite')}${DIM('[')}${state.currentAgent}${DIM('](')}${label}${DIM(')>')} `,
+    `${hydraColor('hydra-lite')}${DIM('[')}${agentColor(state.currentAgent)}${DIM('](')}${label}${DIM(')>')} `,
   );
 }
 
@@ -525,7 +546,7 @@ async function dispatchStatusCommand(state: ConsoleState): Promise<void> {
   }
   for (const task of tasks) {
     const agent = task.effect === 'edit' ? resolveTaskAgent(task) : null;
-    const agentLabel = agent == null ? DIM('-') : getAgentColor(agent)(agent);
+    const agentLabel = agent == null ? DIM('-') : PROMPT_AGENT_COLORS[agent](agent);
     const goal = task.title === '' ? task.notes : task.title;
     console.log(
       `  ${pc.bold(task.id)} ${DIM(`[${task.status}]`)} ${agentLabel} ${goal} ${DIM(`(${relativeTime(task.updatedAt)})`)}`,
