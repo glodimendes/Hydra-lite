@@ -169,6 +169,11 @@ function truncateForProgressLine(text: string, max = 160): string {
  * `item.completed` events carry anything worth showing; `thread.started`/
  * `turn.started`/`turn.completed` are structural bookkeeping the chat
  * console's own stage lines (lib/hydra-lite-run-edit.ts) already cover.
+ *
+ * Returns plain, undecorated text — no indent, bullet, or color. The
+ * caller (hydra-lite-run-edit.ts's agentLine) is the single place that
+ * decides how an agent's own words are presented, so the same event
+ * looks the same whether it came from Codex or Claude's session module.
  */
 export function formatCodexProgressEvent(event: unknown): string | null {
   if (event == null || typeof event !== 'object') return null;
@@ -180,13 +185,13 @@ export function formatCodexProgressEvent(event: unknown): string | null {
   const itemType = itemRecord['type'];
   if (itemType === 'agent_message') {
     const text = itemRecord['text'];
-    return typeof text === 'string' ? `    · ${truncateForProgressLine(text)}` : null;
+    return typeof text === 'string' ? truncateForProgressLine(text) : null;
   }
   const detail =
     (itemRecord['command'] as string | undefined) ??
     (itemRecord['path'] as string | undefined) ??
     (itemRecord['text'] as string | undefined);
-  return `    · ${String(itemType)}${detail == null ? '' : `: ${truncateForProgressLine(detail)}`}`;
+  return `${String(itemType)}${detail == null ? '' : `: ${truncateForProgressLine(detail)}`}`;
 }
 
 /**

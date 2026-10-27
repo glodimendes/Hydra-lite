@@ -64,6 +64,7 @@ import {
   hydraLogoCompact,
   divider,
   relativeTime,
+  getAgentColor,
 } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import {
@@ -85,6 +86,7 @@ import {
   runEditWithRetries,
   resolveTaskAgent,
   parseMaxAttempts,
+  agentLine,
   type HydraLiteAgent,
   type LogFn,
 } from './hydra-lite-run-edit.ts';
@@ -472,11 +474,11 @@ async function dispatchAsk(state: ConsoleState, question: string): Promise<void>
       question,
       existingThreadId,
       (line) => {
-        printLine(state, line);
+        printLine(state, agentLine(state.currentAgent, line));
       },
     );
     state.threadIds.set(key, threadId);
-    printLine(state, `  ${answer}`);
+    printLine(state, agentLine(state.currentAgent, answer));
   } finally {
     setBusy(state, false);
   }
@@ -502,10 +504,11 @@ async function dispatchStatusCommand(state: ConsoleState): Promise<void> {
     return;
   }
   for (const task of tasks) {
-    const agent = task.effect === 'edit' ? resolveTaskAgent(task) : '-';
+    const agent = task.effect === 'edit' ? resolveTaskAgent(task) : null;
+    const agentLabel = agent == null ? DIM('-') : getAgentColor(agent)(agent);
     const goal = task.title === '' ? task.notes : task.title;
     console.log(
-      `  ${pc.bold(task.id)} ${DIM(`[${task.status}]`)} ${ACCENT(agent)} ${goal} ${DIM(`(${relativeTime(task.updatedAt)})`)}`,
+      `  ${pc.bold(task.id)} ${DIM(`[${task.status}]`)} ${agentLabel} ${goal} ${DIM(`(${relativeTime(task.updatedAt)})`)}`,
     );
   }
 }

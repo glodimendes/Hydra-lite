@@ -18,7 +18,7 @@
  */
 
 import { exec } from 'node:child_process';
-import { ERROR, SUCCESS, DIM } from './hydra-ui.ts';
+import { ERROR, SUCCESS, DIM, getAgentColor, getAgentIcon } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import { runEdit as runCodexEdit } from './hydra-lite-codex-session.ts';
 import { runEdit as runClaudeEdit } from './hydra-lite-claude-session.ts';
@@ -49,6 +49,37 @@ export type LogFn = (line: string) => void;
  * that existed when it was created. */
 export function resolveTaskAgent(task: TaskEntry): HydraLiteAgent {
   return task.intendedAgent ?? 'codex';
+}
+
+/** The icon+color hydra-ui.ts gives 'system' — reused here to mark a line
+ * as Hydra Lite's own narration ("I'm about to run this", "verification
+ * passed", "committed"), never the agent's own words. Picked once, module
+ * level, purely so hydraLine/agentLine read as a matched pair below. */
+const HYDRA_COLOR = getAgentColor('system');
+const HYDRA_ICON = getAgentIcon('system');
+
+/**
+ * Prefix a line as Hydra Lite's own narration — claim/verify/commit/block
+ * announcements, anything this module says about a run rather than what
+ * the agent itself said or did. `decorated` may already carry its own
+ * ERROR/SUCCESS/DIM coloring (that meaning is preserved); this only adds
+ * the leading marker that makes a /run's interleaved output unambiguous
+ * about who's talking — contrast with agentLine below.
+ */
+export function hydraLine(decorated: string): string {
+  return `  ${HYDRA_COLOR(HYDRA_ICON)} ${decorated}`;
+}
+
+/**
+ * Prefix a line as the agent's own words — one live progress step (a
+ * tool call, a message) or its final reply — colored in that agent's own
+ * color (hydra-ui.ts's AGENT_COLORS: green for codex, orange for claude,
+ * cyan for gemini), so it never reads as something Hydra Lite itself
+ * said. Contrast with hydraLine above.
+ */
+export function agentLine(agent: HydraLiteAgent, text: string): string {
+  const color = getAgentColor(agent);
+  return `    ${color(getAgentIcon(agent))} ${color(text)}`;
 }
 
 /** Dispatch one edit attempt to the agent's own session module. Each
@@ -144,23 +175,25 @@ export async function loadRunnableTask(
 ): Promise<TaskEntry | null> {
   const task = await loadTask(baseUrl, project.id, taskId);
   if (!task) {
-    console.log(ERROR(`  No task ${taskId} in ${project.name}.`));
+    console.log(hydraLine(ERROR(`No task ${taskId} in ${project.name}.`)));
     return null;
   }
   if (task.effect !== 'edit') {
-    console.log(ERROR(`  ${taskId} is not an edit task.`));
+    console.log(hydraLine(ERROR(`${taskId} is not an edit task.`)));
     return null;
   }
   if (task.status !== 'todo') {
     console.log(
-      ERROR(`  ${taskId} is "${task.status}", not approved-and-ready. Approve it first.`),
+      hydraLine(ERROR(`${taskId} is "${task.status}", not approved-and-ready. Approve it first.`)),
     );
     return null;
   }
   if (!isWorkingTreeCleanIgnoringHydraState(project.path)) {
     console.log(
-      ERROR(
-        '  Working tree has uncommitted changes — refusing to risk attributing them to this task. Commit or stash first.',
+      hydraLine(
+        ERROR(
+          'Working tree has uncommitted changes — refusing to risk attributing them to this task. Commit or stash first.',
+        ),
       ),
     );
     return null;
@@ -192,7 +225,9 @@ export async function claimTask(
     return true;
   } catch (err: unknown) {
     console.log(
-      ERROR(`  Could not claim ${taskId}: ${err instanceof Error ? err.message : String(err)}`),
+      hydraLine(
+        ERROR(`Could not claim ${taskId}: ${err instanceof Error ? err.message : String(err)}`),
+      ),
     );
     return false;
   }
@@ -214,7 +249,7 @@ export async function runProjectVerification(
   if (!plan.enabled) {
     return { verification: { passed: true, checkedAt: new Date().toISOString() }, output: '' };
   }
-  log(DIM(`  Verifying: ${plan.command}`));
+  log(hydraLine(DIM(`Verifying: ${plan.command}`)));
   const result = await runVerifyCommand(plan.command, project.path, plan.timeoutMs);
   return {
     verification: {
@@ -259,10 +294,12 @@ export async function commitEdit(
       verification,
       usage,
     );
-    log(ERROR(`  Commit failed: ${message}`));
+    log(hydraLine(ERROR(`Commit failed: ${message}`)));
     log(
-      DIM(
-        `  ${taskId} set to blocked. Changes are verified but still uncommitted at ${project.path}.`,
+      hydraLine(
+        DIM(
+          `${taskId} set to blocked. Changes are verified but still uncommitted at ${project.path}.`,
+        ),
       ),
     );
     return;
@@ -280,12 +317,14 @@ export async function commitEdit(
   });
   const fileWord = changedFiles.length === 1 ? 'file' : 'files';
   log(
-    SUCCESS(
-      `  ${taskId} done. Committed ${sha.slice(0, 10)} (${String(changedFiles.length)} ${fileWord}).`,
+    hydraLine(
+      SUCCESS(
+        `${taskId} done. Committed ${sha.slice(0, 10)} (${String(changedFiles.length)} ${fileWord}).`,
+      ),
     ),
   );
   for (const file of changedFiles) {
-    log(DIM(`    ${file}`));
+    log(hydraLine(DIM(`  ${file}`)));
   }
 }
 
@@ -330,7 +369,7 @@ async function markNoChangesDone(
     usage,
     verify: false,
   });
-  log(SUCCESS(`  ${agent} made no file changes. ${taskId} marked done.`));
+  log(hydraLine(SUCCESS(`${agent} made no file changes. ${taskId} marked done.`)));
 }
 
 /** Verification failed — either hand back a 'retry' outcome (more
@@ -349,12 +388,14 @@ async function handleVerificationFailure(
   log: LogFn,
 ): Promise<AttemptOutcome> {
   log(
-    ERROR(
-      `  Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
+    hydraLine(
+      ERROR(
+        `Verification failed (attempt ${String(attempt)}/${String(maxAttempts)}): ${outcome.verification.command ?? ''}`,
+      ),
     ),
   );
   if (attempt < maxAttempts) {
-    log(DIM('  Retrying with the failure as feedback...'));
+    log(hydraLine(DIM('Retrying with the failure as feedback...')));
     return { status: 'retry', threadId: nextThreadId, failure: outcome };
   }
   await markBlocked(
@@ -367,8 +408,10 @@ async function handleVerificationFailure(
     usage,
   );
   log(
-    DIM(
-      `  ${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
+    hydraLine(
+      DIM(
+        `${taskId} set to blocked after ${String(attempt)} attempt(s). Working tree left as-is — inspect it at ${project.path}.`,
+      ),
     ),
   );
   return { status: 'blocked' };
@@ -397,7 +440,9 @@ export async function runOneEditAttempt(
   log: LogFn,
 ): Promise<AttemptOutcome> {
   log(
-    DIM(`  Running ${taskId} via ${agent} (attempt ${String(attempt)}/${String(maxAttempts)})...`),
+    hydraLine(
+      DIM(`Running ${taskId} via ${agent} (attempt ${String(attempt)}/${String(maxAttempts)})...`),
+    ),
   );
   const originalPrompt = task.notes === '' ? task.title : task.notes;
   const prompt = lastFailure == null ? originalPrompt : buildRetryPrompt(task, lastFailure);
@@ -406,7 +451,9 @@ export async function runOneEditAttempt(
   let summary: string;
   let usage: TaskUsage | undefined;
   try {
-    const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs, log);
+    const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs, (line) => {
+      log(agentLine(agent, line));
+    });
     nextThreadId = result.threadId;
     summary = result.summary;
     usage = result.usage;
@@ -419,11 +466,11 @@ export async function runOneEditAttempt(
       `[Hydra Lite /run] ${agent} invocation failed on attempt ${String(attempt)}: ${message}`,
       attempt,
     );
-    log(ERROR(`  ${agent} invocation failed: ${message}`));
-    log(DIM(`  ${taskId} set to blocked.`));
+    log(hydraLine(ERROR(`${agent} invocation failed: ${message}`)));
+    log(hydraLine(DIM(`${taskId} set to blocked.`)));
     return { status: 'blocked' };
   }
-  log(`  ${summary}`);
+  log(agentLine(agent, summary));
 
   const changedFiles = listChangedFiles(project.path);
   if (changedFiles.length === 0) {
@@ -433,7 +480,7 @@ export async function runOneEditAttempt(
 
   const outcome = await runProjectVerification(project, log);
   if (outcome.verification.passed) {
-    log(SUCCESS('  Verification passed.'));
+    log(hydraLine(SUCCESS('Verification passed.')));
     await commitEdit(
       baseUrl,
       project,

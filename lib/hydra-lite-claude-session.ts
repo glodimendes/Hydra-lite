@@ -193,41 +193,51 @@ function truncateForProgressLine(text: string, max = 160): string {
 }
 
 /**
- * Turn one parsed JSONL event into zero or more short, human-readable
- * progress lines, or null to skip it — the same "in-between" level of
- * detail as hydra-lite-codex-session.ts's formatCodexProgressEvent: one
- * line per completed step (an assistant message, a tool call), never raw
- * per-token deltas. Only `assistant` events carry anything worth showing;
- * `system`/`user`(tool-result)/`result` are bookkeeping the chat
- * console's own stage lines already cover.
+ * Format one content block from an `assistant` event — a text chunk or a
+ * tool call — as plain, undecorated text, or null to skip it. No indent,
+ * bullet, or color: the caller (hydra-lite-run-edit.ts's agentLine) is
+ * the single place that decides how an agent's own words are presented,
+ * so the same kind of step looks the same whether it came from Claude or
+ * Codex's session module.
  */
 function formatContentBlock(block: unknown): string | null {
   if (block == null || typeof block !== 'object') return null;
   const b = block as Record<string, unknown>;
   if (b['type'] === 'text' && typeof b['text'] === 'string' && b['text'].trim() !== '') {
-    return `    · ${truncateForProgressLine(b['text'])}`;
+    return truncateForProgressLine(b['text']);
   }
   if (b['type'] === 'tool_use' && typeof b['name'] === 'string') {
-    return `    · ${b['name']}`;
+    return `tool_use: ${b['name']}`;
   }
   return null;
 }
 
-export function formatClaudeProgressEvent(event: unknown): string | null {
-  if (event == null || typeof event !== 'object') return null;
+/**
+ * Turn one parsed JSONL event into zero or more short, human-readable
+ * progress lines — the same "in-between" level of detail as
+ * hydra-lite-codex-session.ts's formatCodexProgressEvent: one line per
+ * completed step (an assistant message, a tool call), never raw
+ * per-token deltas. Only `assistant` events carry anything worth
+ * showing; `system`/`user`(tool-result)/`result` are bookkeeping the
+ * chat console's own stage lines already cover. Returns an array (not a
+ * single joined string) so a message with several blocks becomes several
+ * separately-decorated lines rather than one block of text with only the
+ * first line tagged.
+ */
+export function formatClaudeProgressEvent(event: unknown): string[] {
+  if (event == null || typeof event !== 'object') return [];
   const record = event as Record<string, unknown>;
-  if (record['type'] !== 'assistant') return null;
+  if (record['type'] !== 'assistant') return [];
   const message = record['message'];
-  if (message == null || typeof message !== 'object') return null;
+  if (message == null || typeof message !== 'object') return [];
   const content = (message as Record<string, unknown>)['content'];
-  if (!Array.isArray(content)) return null;
-  const lines = content.map(formatContentBlock).filter((line): line is string => line != null);
-  return lines.length === 0 ? null : lines.join('\n');
+  if (!Array.isArray(content)) return [];
+  return content.map(formatContentBlock).filter((line): line is string => line != null);
 }
 
-/** Parse one raw stdout line as a JSONL event and forward it to
- * `onProgress` as formatted line(s), skipping non-JSON noise and any
- * event with nothing worth showing. */
+/** Parse one raw stdout line as a JSONL event and forward each of its
+ * formatted progress lines to `onProgress` individually, skipping
+ * non-JSON noise and any event with nothing worth showing. */
 function bridgeProgress(onProgress: (line: string) => void): (raw: string) => void {
   return (raw: string) => {
     if (raw.trim() === '') return;
@@ -237,8 +247,7 @@ function bridgeProgress(onProgress: (line: string) => void): (raw: string) => vo
     } catch {
       return;
     }
-    const line = formatClaudeProgressEvent(event);
-    if (line != null) onProgress(line);
+    for (const line of formatClaudeProgressEvent(event)) onProgress(line);
   };
 }
 

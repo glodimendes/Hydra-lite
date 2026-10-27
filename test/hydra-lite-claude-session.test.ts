@@ -197,8 +197,8 @@ describe('parseUsage', () => {
 });
 
 describe('formatClaudeProgressEvent', () => {
-  it('formats an assistant text block', () => {
-    const line = formatClaudeProgressEvent(
+  it('formats an assistant text block as plain, undecorated text', () => {
+    const lines = formatClaudeProgressEvent(
       JSON.parse(
         JSON.stringify({
           type: 'assistant',
@@ -206,11 +206,11 @@ describe('formatClaudeProgressEvent', () => {
         }),
       ),
     );
-    assert.match(line ?? '', /Looking at greet\.js now\./);
+    assert.deepEqual(lines, ['Looking at greet.js now.']);
   });
 
   it('formats an assistant tool_use block by tool name', () => {
-    const line = formatClaudeProgressEvent(
+    const lines = formatClaudeProgressEvent(
       JSON.parse(
         JSON.stringify({
           type: 'assistant',
@@ -218,14 +218,31 @@ describe('formatClaudeProgressEvent', () => {
         }),
       ),
     );
-    assert.match(line ?? '', /Edit/);
+    assert.deepEqual(lines, ['tool_use: Edit']);
   });
 
-  it('returns null for a result event', () => {
-    assert.equal(formatClaudeProgressEvent(JSON.parse(REAL_ERROR_RESULT)), null);
+  it('returns one line per block when a message has several', () => {
+    const lines = formatClaudeProgressEvent(
+      JSON.parse(
+        JSON.stringify({
+          type: 'assistant',
+          message: {
+            content: [
+              { type: 'text', text: 'Editing greet.js.' },
+              { type: 'tool_use', name: 'Edit', input: {} },
+            ],
+          },
+        }),
+      ),
+    );
+    assert.deepEqual(lines, ['Editing greet.js.', 'tool_use: Edit']);
   });
 
-  it('returns null for a system event', () => {
-    assert.equal(formatClaudeProgressEvent({ type: 'system', subtype: 'init' }), null);
+  it('returns an empty array for a result event', () => {
+    assert.deepEqual(formatClaudeProgressEvent(JSON.parse(REAL_ERROR_RESULT)), []);
+  });
+
+  it('returns an empty array for a system event', () => {
+    assert.deepEqual(formatClaudeProgressEvent({ type: 'system', subtype: 'init' }), []);
   });
 });
