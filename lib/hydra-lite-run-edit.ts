@@ -1,6 +1,6 @@
 /**
- * Shared "execute an approved edit task" logic: claim, invoke Codex
- * (resuming with feedback on a failed verification), verify, and make
+ * Shared "execute an approved edit task" logic: claim, invoke the task's
+ * agent (resuming with feedback on a failed verification), verify, and make
  * exactly one scoped commit on the attempt that verifies cleanly — or
  * block the task, tree left dirty for inspection, if every attempt fails.
  *
@@ -10,12 +10,18 @@
  * copies that could drift. The chat console still owns its own
  * `dispatchRunCommand` wiring (argument parsing, the "no current project"
  * check); this module owns everything from "load the task" onward.
+ *
+ * Multi-CLI: which agent actually runs an attempt is the task's own
+ * `intendedAgent` (resolveTaskAgent), set once at `/edit` time — never
+ * whichever `/agent` the chat console currently has active. `runEditFor`
+ * is the only place that picks a concrete session module by agent name.
  */
 
 import { exec } from 'node:child_process';
 import { ERROR, SUCCESS, DIM } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
-import { runEdit } from './hydra-lite-codex-session.ts';
+import { runEdit as runCodexEdit } from './hydra-lite-codex-session.ts';
+import { runEdit as runClaudeEdit } from './hydra-lite-claude-session.ts';
 import {
   listChangedFiles,
   stageAndCommitFiles,
@@ -24,6 +30,37 @@ import {
 import { resolveProjectVerificationPlan } from './hydra-lite-project-config.ts';
 import type { RegisteredProject } from './hydra-registry.ts';
 import type { HydraStateShape, TaskEntry } from './types.ts';
+
+/** The runtime agents `/run` (and the worker) can dispatch an edit attempt
+ * to. Kept in sync with types.ts's `TaskEntry['intendedAgent']` and the
+ * daemon's `KNOWN_INTENDED_AGENTS` (lib/daemon/write-routes.ts). */
+export type HydraLiteAgent = 'codex' | 'claude' | 'gemini';
+
+/** A task queued before multi-CLI support (or a read task, which never
+ * carries `intendedAgent`) always executes under Codex — the only agent
+ * that existed when it was created. */
+export function resolveTaskAgent(task: TaskEntry): HydraLiteAgent {
+  return task.intendedAgent ?? 'codex';
+}
+
+/** Dispatch one edit attempt to the agent's own session module. Each
+ * module mirrors hydra-lite-codex-session.ts's `runEdit(projectRoot,
+ * prompt, existingThreadId?, timeoutMs?)` shape, so adding a fourth agent
+ * here is a one-line addition, not a redesign. Gemini CLI isn't installed
+ * on the development machine yet, so it's typed and routed but not wired
+ * to a real session module — selecting it fails loudly instead of silently
+ * falling back to a different CLI. */
+function runEditFor(
+  agent: HydraLiteAgent,
+  projectRoot: string,
+  prompt: string,
+  existingThreadId: string | undefined,
+  timeoutMs: number | undefined,
+): ReturnType<typeof runCodexEdit> {
+  if (agent === 'codex') return runCodexEdit(projectRoot, prompt, existingThreadId, timeoutMs);
+  if (agent === 'claude') return runClaudeEdit(projectRoot, prompt, existingThreadId, timeoutMs);
+  throw new Error(`Gemini CLI support is not implemented yet (agent "${agent}").`);
+}
 
 /** `/run <taskId>` (or the worker) with no explicit attempt count retries
  * this many times total (1 initial attempt + 1 retry) before giving up. */
@@ -117,23 +154,24 @@ export async function loadRunnableTask(
 }
 
 /** Claim the task so no other claim can touch it while execution works,
- * including across retries. Always claims as 'codex' — the daemon's claim
- * path (lib/daemon/task-helpers.ts's ensureKnownAgent) only recognizes the
- * product's physical agents (human/gemini/codex/claude), confirmed live;
- * widening that allowlist for a synthetic worker identity would reach into
- * the excluded multi-agent agent model, which is out of scope here. `note`,
- * when given, is appended to the task's notes instead, so history still
- * shows whether a human (`/run`) or the unattended worker claimed it. */
+ * including across retries. Claims as the task's own agent (its
+ * `intendedAgent`, resolved by the caller — see resolveTaskAgent) — the
+ * daemon's claim path (lib/daemon/task-helpers.ts's ensureKnownAgent) only
+ * recognizes the product's physical agents (human/gemini/codex/claude),
+ * confirmed live. `note`, when given, is appended to the task's notes
+ * instead, so history still shows whether a human (`/run`) or the
+ * unattended worker claimed it. */
 export async function claimTask(
   baseUrl: string,
   project: RegisteredProject,
   taskId: string,
+  agent: HydraLiteAgent,
   note?: string,
 ): Promise<boolean> {
   try {
     await request('POST', baseUrl, `/task/claim?projectId=${project.id}`, {
       taskId,
-      agent: 'codex',
+      agent,
       notes: note,
     });
     return true;
@@ -262,20 +300,23 @@ export async function runOneEditAttempt(
   project: RegisteredProject,
   taskId: string,
   task: TaskEntry,
+  agent: HydraLiteAgent,
   attempt: number,
   maxAttempts: number,
   threadId: string | undefined,
   lastFailure: VerifyOutcome | null,
   timeoutMs?: number,
 ): Promise<AttemptOutcome> {
-  console.log(DIM(`  Running ${taskId} (attempt ${String(attempt)}/${String(maxAttempts)})...`));
+  console.log(
+    DIM(`  Running ${taskId} via ${agent} (attempt ${String(attempt)}/${String(maxAttempts)})...`),
+  );
   const originalPrompt = task.notes === '' ? task.title : task.notes;
   const prompt = lastFailure == null ? originalPrompt : buildRetryPrompt(task, lastFailure);
 
   let nextThreadId: string;
   let summary: string;
   try {
-    const result = await runEdit(project.path, prompt, threadId, timeoutMs);
+    const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs);
     nextThreadId = result.threadId;
     summary = result.summary;
   } catch (err: unknown) {
@@ -284,10 +325,10 @@ export async function runOneEditAttempt(
       baseUrl,
       project.id,
       taskId,
-      `[Hydra Lite /run] Codex invocation failed on attempt ${String(attempt)}: ${message}`,
+      `[Hydra Lite /run] ${agent} invocation failed on attempt ${String(attempt)}: ${message}`,
       attempt,
     );
-    console.log(ERROR(`  Codex invocation failed: ${message}`));
+    console.log(ERROR(`  ${agent} invocation failed: ${message}`));
     console.log(DIM(`  ${taskId} set to blocked.`));
     return { status: 'blocked' };
   }
@@ -352,6 +393,7 @@ export async function runEditWithRetries(
   project: RegisteredProject,
   taskId: string,
   task: TaskEntry,
+  agent: HydraLiteAgent,
   maxAttempts: number,
   timeoutMs?: number,
 ): Promise<'done' | 'blocked'> {
@@ -365,6 +407,7 @@ export async function runEditWithRetries(
       project,
       taskId,
       task,
+      agent,
       attempt,
       maxAttempts,
       threadId,

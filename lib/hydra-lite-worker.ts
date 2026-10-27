@@ -138,6 +138,10 @@ async function fetchRunnableTasks(
       (t) =>
         t.effect === 'edit' &&
         t.status === 'todo' &&
+        // This milestone's unattended worker only runs Codex — a task
+        // explicitly queued for claude/gemini (intendedAgent set to
+        // something else) is left for a human's `/run` instead.
+        (t.intendedAgent == null || t.intendedAgent === 'codex') &&
         !excludedKeys.has(excludeKey(project.id, t.id)),
     )
     .map((t) => ({
@@ -232,7 +236,7 @@ export async function runWorker(args: WorkerArgs, shouldStop: () => boolean): Pr
       continue;
     }
     // eslint-disable-next-line no-await-in-loop -- see above
-    const claimed = await claimTask(args.baseUrl, project, pick.taskId, WORKER_CLAIM_NOTE);
+    const claimed = await claimTask(args.baseUrl, project, pick.taskId, 'codex', WORKER_CLAIM_NOTE);
     if (!claimed) {
       // Most likely the concurrency gate (lib/daemon/scheduler.ts) rejected
       // it, or a human claimed it meanwhile — either way, skip and try the
@@ -250,6 +254,7 @@ export async function runWorker(args: WorkerArgs, shouldStop: () => boolean): Pr
       project,
       pick.taskId,
       task,
+      'codex',
       DEFAULT_MAX_ATTEMPTS,
       timeoutMs,
     );

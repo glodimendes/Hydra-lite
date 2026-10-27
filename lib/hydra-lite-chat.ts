@@ -1,35 +1,43 @@
 /**
  * Hydra Lite chat console.
  *
- * A small, Codex-only REPL: converse, switch between registered projects
- * by name, and propose/approve/run edits. Deliberately NOT built on top of
- * lib/hydra-operator.ts's free-text dispatch (handleAutoSmartLine /
- * handleCouncilLine / handleHandoffLine) — that loop picks a "best agent"
- * across claude/gemini/codex or runs multi-round council, neither of which
- * belongs in a Codex-only product. This console reuses lib/hydra-ui.ts's
- * visual helpers for a similar feel, but its own small dispatch loop.
+ * A small REPL: converse, switch between registered projects by name,
+ * propose/approve/run edits, and pick which CLI (codex/claude/gemini)
+ * actually does the work via one global `/agent` setting. Deliberately
+ * NOT built on top of lib/hydra-operator.ts's free-text dispatch
+ * (handleAutoSmartLine / handleCouncilLine / handleHandoffLine) — that
+ * loop picks a "best agent" by routing heuristics or runs multi-round
+ * council, neither of which fits this product's one-agent-at-a-time,
+ * human-picked model. This console reuses lib/hydra-ui.ts's visual
+ * helpers for a similar feel, but its own small dispatch loop.
  *
  * Commands (all `/`-prefixed, matching Codex/Claude CLI convention):
+ *   /agent [codex|claude|gemini] — show, or switch, the active CLI
  *   /project list                — list registered projects
  *   /project use <name|id>       — switch; resumes or starts that project's session
  *   /project verify [cmd|auto|off] — show, set, or clear this project's verify override
  *   /project priority <name|id> <n> — set a project's worker scheduling priority
- *   /edit <instructions>       — queue an approval-gated edit task
+ *   /edit <instructions>       — queue an approval-gated edit task, tagged
+ *                               with the agent active right now (switching
+ *                               /agent later never changes it — see
+ *                               types.ts's `intendedAgent`)
  *   /approve <taskId>          — unblock an awaiting_approval task to todo
  *   /priority <taskId> <n>     — set a task's scheduling priority (default 0)
  *   /run <taskId> [maxAttempts] — execute an approved (todo) edit task: claim,
- *                               invoke Codex in write mode, verify, and (on
- *                               success) make exactly one scoped commit; on
- *                               a failed verification, retry (resuming the
- *                               same thread with the failure as feedback)
- *                               up to maxAttempts (default 2) before blocking
+ *                               invoke the task's own intended agent in write
+ *                               mode, verify, and (on success) make exactly
+ *                               one scoped commit; on a failed verification,
+ *                               retry (resuming the same thread with the
+ *                               failure as feedback) up to maxAttempts
+ *                               (default 2) before blocking
  *   /quit                      — exit
- * Bare text (no leading /) is an implicit question: a read-only Codex call
- * (lib/hydra-lite-codex-session.ts), resumed across turns within one
- * project so Codex remembers the conversation — never resumed across a
- * privilege boundary (an edit's /run always starts its own fresh,
- * write-enabled session; a /run retry resumes that session, never a
- * read-only ask-thread).
+ * Bare text (no leading /) is an implicit question: a read-only call to
+ * the active `/agent`, resumed across turns within one project+agent pair
+ * so it remembers the conversation — never resumed across a privilege
+ * boundary (an edit's /run always starts its own fresh, write-enabled
+ * session; a /run retry resumes that session, never a read-only
+ * ask-thread) and never across an agent switch (each agent's CLI session
+ * ids aren't interchangeable with another's).
  */
 
 import readline from 'node:readline';
@@ -42,7 +50,8 @@ import {
   setProjectPriority,
   type RegisteredProject,
 } from './hydra-registry.ts';
-import { runAsk } from './hydra-lite-codex-session.ts';
+import { runAsk as runCodexAsk } from './hydra-lite-codex-session.ts';
+import { runAsk as runClaudeAsk } from './hydra-lite-claude-session.ts';
 import {
   loadProjectConfig,
   saveProjectVerificationOverride,
@@ -52,16 +61,41 @@ import {
   loadRunnableTask,
   claimTask,
   runEditWithRetries,
+  resolveTaskAgent,
   parseMaxAttempts,
+  type HydraLiteAgent,
 } from './hydra-lite-run-edit.ts';
 import type { HydraStateShape } from './types.ts';
 
 const DEFAULT_URL = process.env['AI_ORCH_URL'] ?? 'http://127.0.0.1:4173';
+const KNOWN_AGENTS: readonly HydraLiteAgent[] = ['codex', 'claude', 'gemini'];
 
 interface ConsoleState {
   baseUrl: string;
   currentProject: RegisteredProject | null;
+  currentAgent: HydraLiteAgent;
+  /** Keyed by `${projectId}:${agent}` — a session id from one CLI is never
+   * valid to resume with another, so switching /agent must never reuse an
+   * old thread. */
   threadIds: Map<string, string>;
+}
+
+function threadKey(state: ConsoleState, projectId: string): string {
+  return `${projectId}:${state.currentAgent}`;
+}
+
+/** Ask the active agent a read-only question. Each CLI's session module
+ * mirrors the same `runAsk(projectRoot, prompt, existingThreadId?)` shape
+ * (lib/hydra-lite-codex-session.ts / hydra-lite-claude-session.ts). */
+function askActiveAgent(
+  agent: HydraLiteAgent,
+  projectRoot: string,
+  prompt: string,
+  existingThreadId: string | undefined,
+): ReturnType<typeof runCodexAsk> {
+  if (agent === 'codex') return runCodexAsk(projectRoot, prompt, existingThreadId);
+  if (agent === 'claude') return runClaudeAsk(projectRoot, prompt, existingThreadId);
+  throw new Error(`Gemini CLI support is not implemented yet (agent "${agent}").`);
 }
 
 function stripAnsiForReadlineWidth(s: string): string {
@@ -72,8 +106,9 @@ function stripAnsiForReadlineWidth(s: string): string {
 function printWelcome(): void {
   console.log('');
   console.log(hydraLogoCompact());
-  console.log(DIM('  Hydra Lite chat — Codex only'));
+  console.log(DIM('  Hydra Lite chat'));
   console.log('');
+  console.log(`  ${ACCENT('/agent [codex|claude|gemini]')}  Show, or switch, the active CLI`);
   console.log(`  ${ACCENT('/project list')}            List registered projects`);
   console.log(`  ${ACCENT('/project use <name|id>')}   Switch projects`);
   console.log(
@@ -91,13 +126,35 @@ function printWelcome(): void {
     `  ${ACCENT('/run <taskId> [maxAttempts]')}  Execute an approved edit, retrying on verify failure`,
   );
   console.log(`  ${ACCENT('/quit')}                    Exit`);
-  console.log(DIM('  Anything else is a question for Codex about the current project.'));
+  console.log(
+    DIM('  Anything else is a question for the active /agent about the current project.'),
+  );
   console.log('');
 }
 
 function buildPrompt(state: ConsoleState): string {
   const label = state.currentProject ? state.currentProject.name : DIM('no project');
-  return stripAnsiForReadlineWidth(`${ACCENT('hydra-lite')}${DIM('(')}${label}${DIM(')>')} `);
+  return stripAnsiForReadlineWidth(
+    `${ACCENT('hydra-lite')}${DIM('[')}${state.currentAgent}${DIM('](')}${label}${DIM(')>')} `,
+  );
+}
+
+/** Show, or switch, the chat console's one global active-agent setting.
+ * Switching never touches an already-queued task's own intendedAgent (see
+ * types.ts) — it only decides what a NEW /edit gets tagged with, and
+ * which CLI bare-text Q&A talks to from now on. */
+function dispatchAgentCommand(state: ConsoleState, rest: string): void {
+  const arg = rest.trim().toLowerCase();
+  if (arg === '') {
+    console.log(`  Active agent: ${pc.bold(state.currentAgent)}`);
+    return;
+  }
+  if (!KNOWN_AGENTS.includes(arg as HydraLiteAgent)) {
+    console.log(ERROR(`  Unknown agent "${arg}". Use one of: ${KNOWN_AGENTS.join(', ')}.`));
+    return;
+  }
+  state.currentAgent = arg as HydraLiteAgent;
+  console.log(SUCCESS(`  Active agent is now ${state.currentAgent}.`));
 }
 
 function printProjectList(state: ConsoleState): void {
@@ -255,10 +312,12 @@ async function dispatchEditCommand(state: ConsoleState, instructions: string): P
     'POST',
     state.baseUrl,
     `/task/add?projectId=${state.currentProject.id}`,
-    { title, notes: instructions, effect: 'edit' },
+    { title, notes: instructions, effect: 'edit', intendedAgent: state.currentAgent },
   );
   console.log(
-    SUCCESS(`  Queued edit task ${String(task['id'])} (status: ${String(task['status'])}).`),
+    SUCCESS(
+      `  Queued edit task ${String(task['id'])} for ${state.currentAgent} (status: ${String(task['status'])}).`,
+    ),
   );
   console.log(
     DIM(`  Run /approve ${String(task['id'])} to unblock it — this does not execute it.`),
@@ -308,9 +367,10 @@ async function dispatchRunCommand(state: ConsoleState, rawArgs: string): Promise
 
   const task = await loadRunnableTask(baseUrl, project, taskId);
   if (!task) return;
-  if (!(await claimTask(baseUrl, project, taskId))) return;
+  const agent = resolveTaskAgent(task);
+  if (!(await claimTask(baseUrl, project, taskId, agent))) return;
 
-  await runEditWithRetries(baseUrl, project, taskId, task, maxAttempts);
+  await runEditWithRetries(baseUrl, project, taskId, task, agent, maxAttempts);
 }
 
 async function dispatchAsk(state: ConsoleState, question: string): Promise<void> {
@@ -318,9 +378,15 @@ async function dispatchAsk(state: ConsoleState, question: string): Promise<void>
     console.log(ERROR('  No current project — run /project use <name|id> first.'));
     return;
   }
-  const existingThreadId = state.threadIds.get(state.currentProject.id);
-  const { threadId, answer } = await runAsk(state.currentProject.path, question, existingThreadId);
-  state.threadIds.set(state.currentProject.id, threadId);
+  const key = threadKey(state, state.currentProject.id);
+  const existingThreadId = state.threadIds.get(key);
+  const { threadId, answer } = await askActiveAgent(
+    state.currentAgent,
+    state.currentProject.path,
+    question,
+    existingThreadId,
+  );
+  state.threadIds.set(key, threadId);
   console.log(`  ${answer}`);
 }
 
@@ -330,6 +396,10 @@ async function dispatchLine(state: ConsoleState, line: string): Promise<boolean>
   if (trimmed === '/quit' || trimmed === '/exit') return false;
   if (trimmed === '/help') {
     printWelcome();
+    return true;
+  }
+  if (trimmed === '/agent' || trimmed.startsWith('/agent ')) {
+    dispatchAgentCommand(state, trimmed.slice('/agent'.length));
     return true;
   }
   if (trimmed === '/project' || trimmed.startsWith('/project ')) {
@@ -365,6 +435,7 @@ function main(): void {
   const state: ConsoleState = {
     baseUrl: urlArg == null ? DEFAULT_URL : urlArg.slice('url='.length),
     currentProject: null,
+    currentAgent: 'codex',
     threadIds: new Map(),
   };
 

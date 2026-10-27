@@ -199,6 +199,13 @@ export interface HydraLiteTaskFields {
   /** Deterministic Codex routing tier; edit tasks floor at 'balanced'. */
   tier?: 'low' | 'balanced' | 'high';
   approval?: TaskApproval;
+  /** Hydra Lite only: the runtime agent (`codex`|`claude`|`gemini`) active
+   * in the chat console when an edit task was queued via `/edit`. Set once,
+   * at creation, and never changed afterward — `/run` always executes the
+   * task under this agent, never whichever `/agent` happens to be active at
+   * run time, so switching agents never silently changes an already-queued
+   * task. Unset on legacy/read tasks, which fall back to `codex`. */
+  intendedAgent?: 'codex' | 'claude' | 'gemini';
   verification?: { passed: boolean; command?: string; checkedAt: string };
   /** Changed-file manifest staged by the (future) scoped commit step. */
   manifest?: string[];

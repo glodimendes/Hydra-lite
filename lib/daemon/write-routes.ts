@@ -892,6 +892,11 @@ function resolveTaskAddEffectAndStatus(body: Record<string, unknown>): {
   return { effect, status };
 }
 
+/** Hydra Lite multi-CLI agent selection: the physical agents a task's
+ * `intendedAgent` may name — the chat console's `/agent` values, never
+ * `human` or a synthetic owner. */
+const KNOWN_INTENDED_AGENTS = new Set(['codex', 'claude', 'gemini']);
+
 function stampHydraLiteTaskFields(
   item: Record<string, unknown>,
   projectId: string | undefined,
@@ -906,6 +911,10 @@ function stampHydraLiteTaskFields(
   item['tier'] = resolveTier(effect, tierOverride);
   if (effect === 'edit') {
     item['approval'] = { status: 'pending', requestedAt: nowIso() };
+    // Validated by handleTaskAdd before enqueueMutation runs this mutator —
+    // only ever a known value or absent by the time it's read here.
+    const intendedAgent = ((body['intendedAgent'] as string | null | undefined) ?? '').trim();
+    if (intendedAgent !== '') item['intendedAgent'] = intendedAgent;
   }
 }
 
@@ -962,6 +971,11 @@ async function handleTaskAdd(ctx: WriteRouteCtx): Promise<boolean> {
   ensureKnownAgent(owner);
   const { effect, status } = resolveTaskAddEffectAndStatus(body);
   ensureKnownStatus(status);
+  const intendedAgentRaw = ((body['intendedAgent'] as string | null | undefined) ?? '').trim();
+  if (intendedAgentRaw !== '' && !KNOWN_INTENDED_AGENTS.has(intendedAgentRaw)) {
+    sendError(res, 400, `Unknown intendedAgent "${intendedAgentRaw}".`);
+    return true;
+  }
   const files = parseList(body['files'] ?? []);
   const notes = ((body['notes'] as string | null | undefined) ?? '').trim();
   const blockedBy = parseList(body['blockedBy'] ?? []);
