@@ -87,7 +87,8 @@ import {
   runEditWithRetries,
   resolveTaskAgent,
   parseMaxAttempts,
-  agentLine,
+  agentProgressLine,
+  agentOutputLine,
   type HydraLiteAgent,
   type LogFn,
 } from './hydra-lite-run-edit.ts';
@@ -515,11 +516,11 @@ async function dispatchAsk(state: ConsoleState, question: string): Promise<void>
       question,
       existingThreadId,
       (line) => {
-        printLine(state, agentLine(state.currentAgent, line));
+        printLine(state, agentProgressLine(state.currentAgent, line));
       },
     );
     state.threadIds.set(key, threadId);
-    printLine(state, agentLine(state.currentAgent, answer));
+    printLine(state, agentOutputLine(state.currentAgent, answer));
   } finally {
     setBusy(state, false);
   }

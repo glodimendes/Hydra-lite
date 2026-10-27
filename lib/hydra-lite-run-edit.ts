@@ -18,7 +18,7 @@
  */
 
 import { exec } from 'node:child_process';
-import { DIM, getAgentIcon } from './hydra-ui.ts';
+import { DIM, HIGHLIGHT, getAgentIcon } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
 import { runEdit as runCodexEdit } from './hydra-lite-codex-session.ts';
 import { runEdit as runClaudeEdit } from './hydra-lite-claude-session.ts';
@@ -54,17 +54,19 @@ export function resolveTaskAgent(task: TaskEntry): HydraLiteAgent {
 /** The icon hydra-ui.ts gives 'system' — reused here to mark a line as
  * Hydra Lite's own narration ("I'm about to run this", "verification
  * passed", "committed"), never the agent's own words. Picked once,
- * module level, purely so hydraLine/agentLine read as a matched pair. */
+ * module level, purely so hydraLine and the agent*Line functions below
+ * read as a matched set. */
 const HYDRA_ICON = getAgentIcon('system');
 
 /**
  * Prefix a line as Hydra Lite's own narration — claim/verify/commit/block
  * announcements, anything this module says about a run rather than what
  * the agent itself said or did. Always dark grey (hydra-ui.ts's DIM),
- * deliberately flat regardless of outcome — hydra's own voice is one
- * consistent, de-emphasized channel, never competing for attention with
- * the agent's own words (agentLine, below) or the chat console prompt's
- * per-agent color. Takes plain text; callers no longer pre-color it with
+ * deliberately flat regardless of outcome — same treatment as
+ * agentProgressLine below, since both are "process feedback while
+ * running": background noise the agent's actual output
+ * (agentOutputLine) is meant to stand out from, not read as more of the
+ * same. Takes plain text; callers no longer pre-color it with
  * ERROR/SUCCESS/DIM themselves.
  */
 export function hydraLine(text: string): string {
@@ -72,21 +74,35 @@ export function hydraLine(text: string): string {
 }
 
 /**
- * Prefix a line as the agent's own words — one live progress step (a
- * tool call, a message) or its final reply. Deliberately left in the
- * terminal's own default foreground rather than wrapped in a color:
- * plain ANSI black (which this used before) renders as invisible or
- * near-invisible on the dark-background theme most terminals default
- * to, where "black" text sits on a near-black background — picocolors
- * has no portable way to pick a shade that's readably dark on a light
- * theme and readably light on a dark one, so "no color" (inheriting
- * whatever the user's own theme already made legible) is the only
- * choice that works on both. Per-agent differentiation lives in the
- * chat console's prompt instead (hydra-lite-chat.ts's
- * PROMPT_AGENT_COLORS), not here — contrast with hydraLine above.
+ * Prefix a line as one of the agent's own live steps — a tool call, a
+ * reasoning snippet — while it's still working on an attempt. Dark
+ * grey, the same color as hydraLine: this is "process feedback while
+ * running", meant to read as de-emphasized background chatter next to
+ * the agent's actual conclusive output (agentOutputLine, below), which
+ * is the one thing in a /run's interleaved stream that's supposed to
+ * stand out.
  */
-export function agentLine(agent: HydraLiteAgent, text: string): string {
-  return `    ${getAgentIcon(agent)} ${text}`;
+export function agentProgressLine(agent: HydraLiteAgent, text: string): string {
+  return DIM(`    ${getAgentIcon(agent)} ${text}`);
+}
+
+/**
+ * Prefix a line as the agent's actual, conclusive output — its final
+ * reply for an attempt, or a bare-text ask's answer. The one thing
+ * that's supposed to visually stand out from the grey "process
+ * feedback" noise around it (hydraLine, agentProgressLine above) —
+ * bold, left in the terminal's own default foreground rather than any
+ * particular hue. Plain ANSI black (tried first) risks being
+ * unreadable on a dark-background theme; a muted/grey tone (tried
+ * second) was too close to agentProgressLine's own color to actually
+ * tell apart — confirmed by hitting that exact confusion. Bold weight
+ * reads clearly against both a dark and a light theme without needing
+ * to guess a hue right, and can't be confused with the unbold grey
+ * above it. Per-agent color differentiation lives in the chat console's
+ * prompt instead (hydra-lite-chat.ts's PROMPT_AGENT_COLORS), not here.
+ */
+export function agentOutputLine(agent: HydraLiteAgent, text: string): string {
+  return HIGHLIGHT(`    ${getAgentIcon(agent)} ${text}`);
 }
 
 /** Dispatch one edit attempt to the agent's own session module. Each
@@ -447,7 +463,7 @@ export async function runOneEditAttempt(
   let usage: TaskUsage | undefined;
   try {
     const result = await runEditFor(agent, project.path, prompt, threadId, timeoutMs, (line) => {
-      log(agentLine(agent, line));
+      log(agentProgressLine(agent, line));
     });
     nextThreadId = result.threadId;
     summary = result.summary;
@@ -465,7 +481,7 @@ export async function runOneEditAttempt(
     log(hydraLine(`${taskId} set to blocked.`));
     return { status: 'blocked' };
   }
-  log(agentLine(agent, summary));
+  log(agentOutputLine(agent, summary));
 
   const changedFiles = listChangedFiles(project.path);
   if (changedFiles.length === 0) {
