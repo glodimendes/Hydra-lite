@@ -112,6 +112,15 @@ interface ConsoleState {
    * REPL still queues and runs whatever's typed next exactly as before. */
   busy: boolean;
   rl: readline.Interface;
+  /** True once `rl` has closed (via /quit or EOF). A /run's underlying
+   * CLI child process (lib/hydra-lite-codex-session.ts /
+   * hydra-lite-claude-session.ts) isn't killed when the console exits —
+   * a pre-existing gap, not something this flag tries to fix — so a
+   * stray progress line can still arrive after /quit. redrawPrompt/
+   * printLine check this instead of touching a closed readline
+   * interface, which throws (confirmed hands-on: `ERR_USE_AFTER_CLOSE`
+   * crashed the whole process). */
+  closed: boolean;
 }
 
 function threadKey(state: ConsoleState, projectId: string): string {
@@ -184,8 +193,10 @@ function buildPrompt(state: ConsoleState): string {
  * whatever the user has already typed (`preserveCursor`) — the prompt is
  * always there to type into, so this never clears their in-progress
  * line, just repaints it. Call it whenever `state.busy` changes or right
- * after printLine prints something above it. */
+ * after printLine prints something above it. No-ops once `state.closed`
+ * — readline is gone by then, and touching it throws. */
 function redrawPrompt(state: ConsoleState): void {
+  if (state.closed) return;
   state.rl.setPrompt(buildPrompt(state));
   state.rl.prompt(true);
 }
@@ -196,8 +207,15 @@ function redrawPrompt(state: ConsoleState): void {
  * Use this instead of a bare console.log for anything printed while a
  * command may still be running — an agent's progress line, the usage
  * ticker — since a plain console.log there would overwrite the prompt
- * row instead of scrolling above it. */
+ * row instead of scrolling above it. Once `state.closed` (the console
+ * already quit, but a /run's CLI child is still finishing up in the
+ * background — see ConsoleState's docstring), there's no prompt left to
+ * protect, so this just falls back to a plain console.log. */
 function printLine(state: ConsoleState, text: string): void {
+  if (state.closed) {
+    console.log(text);
+    return;
+  }
   readline.clearLine(process.stdout, 0);
   readline.cursorTo(process.stdout, 0);
   console.log(text);
@@ -625,6 +643,7 @@ function main(): void {
     threadIds: new Map(),
     busy: false,
     rl,
+    closed: false,
   };
   redrawPrompt(state);
 
@@ -640,10 +659,12 @@ function main(): void {
   // to finish (e.g. the user types two lines quickly, or stdin reaches EOF
   // while a dispatch is still in flight). Chaining through `processing`
   // guarantees only one dispatchLine runs at a time, which switchProject's
-  // state mutation relies on; the `closed` flag (readline's own `.closed`
+  // state mutation relies on; `state.closed` (readline's own `.closed`
   // isn't in this project's @types/node) guards against prompting an
-  // interface that EOF/`/quit` already closed meanwhile.
-  let closed = false;
+  // interface that EOF/`/quit` already closed meanwhile — and, since
+  // redrawPrompt/printLine check the same flag, against a /run's
+  // still-finishing CLI child trying to do the same from outside this
+  // handler entirely.
   let processing = Promise.resolve();
   rl.on('line', (line: string) => {
     processing = processing.then(async () => {
@@ -657,14 +678,14 @@ function main(): void {
         rl.close();
         return;
       }
-      if (!closed) {
+      if (!state.closed) {
         redrawPrompt(state);
       }
     });
   });
 
   rl.on('close', () => {
-    closed = true;
+    state.closed = true;
     clearInterval(ticker);
     console.log(DIM('\n  Goodbye.'));
     process.exitCode = 0;
