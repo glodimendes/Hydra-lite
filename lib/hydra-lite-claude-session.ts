@@ -49,6 +49,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { registerChild } from './hydra-lite-process-registry.ts';
 import type { TaskUsage } from './types.ts';
 
 /** Start a new, read-only Claude session. Always `--permission-mode plan`
@@ -256,11 +257,13 @@ function bridgeProgress(onProgress: (line: string) => void): (raw: string) => vo
  * code — Claude Code reports failure (e.g. an expired OAuth session)
  * inside a well-formed result object on stdout, not by omitting output,
  * so the caller decides success from that object instead of from the
- * process exit code. When `onLine` is given, it's called with each
- * complete stdout line as it arrives, same streaming behavior as
- * hydra-lite-codex-session.ts's spawnAndCollect. When `timeoutMs` is
- * given, a still-running child is killed (SIGTERM, then SIGKILL after
- * 5s) and the promise rejects.
+ * process exit code. Registers the child with hydra-lite-process-
+ * registry.ts so it's killed too if this program's own process exits
+ * while the child is still running — Node doesn't do that on its own.
+ * When `onLine` is given, it's called with each complete stdout line as
+ * it arrives, same streaming behavior as hydra-lite-codex-session.ts's
+ * spawnAndCollect. When `timeoutMs` is given, a still-running child is
+ * killed (SIGTERM, then SIGKILL after 5s) and the promise rejects.
  */
 function spawnAndCollect(
   cmd: string,
@@ -271,6 +274,7 @@ function spawnAndCollect(
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    registerChild(child);
     let stdout = '';
     let stderr = '';
     let timedOut = false;

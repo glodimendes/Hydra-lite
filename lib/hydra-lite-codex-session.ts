@@ -39,6 +39,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { registerChild } from './hydra-lite-process-registry.ts';
 import type { TaskUsage } from './types.ts';
 
 export interface AskOpts {
@@ -195,12 +196,15 @@ export function formatCodexProgressEvent(event: unknown): string | null {
 }
 
 /**
- * Spawn `cmd`/`args` and collect its output. When `timeoutMs` is given, a
- * still-running child is killed (SIGTERM, then SIGKILL if it hasn't exited
- * within 5s) and the promise rejects — the harness enforces this bound
- * itself rather than trusting Codex to self-report how long it'll take
- * (confirmed unreliable: coding agents including Codex over-predict their
- * own wall-clock runtime). When `onLine` is given, it's called with each
+ * Spawn `cmd`/`args` and collect its output. Registers the child with
+ * hydra-lite-process-registry.ts so it's killed too if this program's
+ * own process exits while the child is still running — Node doesn't do
+ * that on its own. When `timeoutMs` is given, a still-running child is
+ * killed (SIGTERM, then SIGKILL if it hasn't exited within 5s) and the
+ * promise rejects — the harness enforces this bound itself rather than
+ * trusting Codex to self-report how long it'll take (confirmed
+ * unreliable: coding agents including Codex over-predict their own
+ * wall-clock runtime). When `onLine` is given, it's called with each
  * complete stdout line as it arrives (not just once at the end) — chunk
  * boundaries from a real process never line up with JSON line boundaries,
  * so this buffers a partial trailing line across `data` events and flushes
@@ -215,6 +219,7 @@ function spawnAndCollect(
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'] });
+    registerChild(child);
     let stdout = '';
     let stderr = '';
     let timedOut = false;

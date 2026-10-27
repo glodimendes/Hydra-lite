@@ -67,6 +67,8 @@ import {
   getAgentColor,
 } from './hydra-ui.ts';
 import { request } from './hydra-utils.ts';
+import { exit } from './hydra-process.ts';
+import { killAllChildren, killAllChildrenSync } from './hydra-lite-process-registry.ts';
 import {
   listProjects,
   resolveProjectByNameOrId,
@@ -689,7 +691,54 @@ function main(): void {
     clearInterval(ticker);
     console.log(DIM('\n  Goodbye.'));
     process.exitCode = 0;
+    // Don't await: a still-running /run's agent child is what's keeping
+    // this process alive past "Goodbye." in the first place (its open
+    // stdout pipe), so killing it is what lets the event loop actually
+    // drain — see hydra-lite-process-registry.ts's module doc for why
+    // this matters (confirmed hands-on: without it, that child outlives
+    // the console entirely, with no further Hydra Lite oversight).
+    killAllChildren().catch(() => {
+      /* best-effort; process 'exit' below is the synchronous backstop */
+    });
   });
+
+  installShutdownSignalHandlers();
+}
+
+/**
+ * Guarantee no spawned CLI child outlives this console, on every path
+ * that can end it — not just /quit (handled by the 'close' listener
+ * above). A first SIGINT/SIGTERM kills children gracefully (SIGTERM,
+ * then SIGKILL after a grace period) and exits; a second one while
+ * that's still in flight skips the grace period. `process.on('exit', …)`
+ * is the last-resort synchronous backstop for anything else (an
+ * uncaught exception, for instance) — it can't await, so it goes
+ * straight to SIGKILL.
+ */
+function installShutdownSignalHandlers(): void {
+  let shuttingDown = false;
+  const handleSignal = (signal: NodeJS.Signals, exitCode: number): void => {
+    if (shuttingDown) {
+      killAllChildrenSync();
+      exit(1);
+    }
+    shuttingDown = true;
+    console.log(DIM(`\n  Received ${signal} — stopping any in-flight CLI invocation and exiting.`));
+    killAllChildren()
+      .catch(() => {
+        /* best-effort; process 'exit' below is the synchronous backstop */
+      })
+      .finally(() => {
+        exit(exitCode);
+      });
+  };
+  process.on('SIGINT', () => {
+    handleSignal('SIGINT', 130);
+  });
+  process.on('SIGTERM', () => {
+    handleSignal('SIGTERM', 143);
+  });
+  process.on('exit', killAllChildrenSync);
 }
 
 main();

@@ -40,6 +40,8 @@
  */
 
 import { request, parseList } from './hydra-utils.ts';
+import { exit } from './hydra-process.ts';
+import { killAllChildren, killAllChildrenSync } from './hydra-lite-process-registry.ts';
 import {
   listProjects,
   resolveProjectByNameOrId,
@@ -280,9 +282,22 @@ function main(): void {
     `  Hydra Lite worker — max ${String(args.maxTasks)} tasks, max ${String(args.maxRuntimeMinutes)}m runtime${args.projectFilter.length > 0 ? `, projects: ${args.projectFilter.join(', ')}` : ''}`,
   );
 
+  // A first SIGINT/SIGTERM asks runWorker to stop between tasks — the
+  // current claimed task still gets to finish (verify + commit), rather
+  // than being interrupted mid-edit. A second one means "stop now": it
+  // force-kills whatever CLI child is still running (see
+  // hydra-lite-process-registry.ts's module doc — Node doesn't do this
+  // on its own) and exits immediately, rather than the prior behavior of
+  // silently doing nothing and leaving the process to the OS's default
+  // signal disposition, which (since a listener is already registered
+  // below) never actually arrived.
   let stopRequested = false;
   const requestStop = (signal: string): void => {
-    if (stopRequested) return; // second signal: let the process die normally
+    if (stopRequested) {
+      console.log(`\n  Received ${signal} again — killing the in-flight CLI invocation now.`);
+      killAllChildrenSync();
+      exit(1);
+    }
     stopRequested = true;
     console.log(`\n  Received ${signal} — finishing the current task, then stopping.`);
   };
@@ -292,10 +307,15 @@ function main(): void {
   process.on('SIGTERM', () => {
     requestStop('SIGTERM');
   });
+  process.on('exit', killAllChildrenSync);
 
   runWorker(args, () => stopRequested)
-    .then((summary) => {
+    .then(async (summary) => {
       printSummary(summary);
+      // Belt-and-suspenders: runWorker only returns between tasks, so no
+      // child should still be running by now — but confirm rather than
+      // assume, since that assumption is exactly what was wrong before.
+      await killAllChildren(0);
     })
     .catch((err: unknown) => {
       console.error(`  Worker failed: ${err instanceof Error ? err.message : String(err)}`);
