@@ -15,6 +15,9 @@ export const STATUS_VALUES = new Set([
   'done',
   'failed',
   'cancelled',
+  // Hydra Lite's edit-approval gate: an edit-effect task is created directly
+  // in this status and is never claimable until explicitly approved.
+  'awaiting_approval',
 ]);
 
 /**

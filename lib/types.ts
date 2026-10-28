@@ -160,11 +160,88 @@ export type TaskType =
   | 'documentation'
   | 'security';
 
-/** Task lifecycle status values from STATUS_VALUES in orchestrator-daemon.mjs */
-export type TaskStatus = 'todo' | 'in_progress' | 'blocked' | 'done' | 'failed' | 'cancelled';
+/**
+ * Task lifecycle status values from STATUS_VALUES in orchestrator-daemon.mjs.
+ * `awaiting_approval` is Hydra Lite's edit-approval gate (see HYDRA_LITE_TASK_FIELDS
+ * below): an edit-effect task is created directly in this status and is never
+ * claimable until explicitly approved, so Codex is never invoked for it.
+ */
+export type TaskStatus =
+  | 'todo'
+  | 'in_progress'
+  | 'blocked'
+  | 'done'
+  | 'failed'
+  | 'cancelled'
+  | 'awaiting_approval';
+
+/** Hydra Lite's approval record for an edit-effect task. */
+export interface TaskApproval {
+  status: 'pending' | 'approved';
+  requestedAt: string;
+  approvedAt?: string;
+  approvedBy?: string;
+}
+
+/**
+ * Hydra Lite-specific fields layered onto a task. All optional at the type
+ * level so existing single-project literals/fixtures remain valid; the
+ * daemon's Hydra Lite code paths (registry-scoped `/task/add`, `/task/claim`,
+ * `/task/approve`) populate `projectId`/`effect` on every task they create.
+ * `manifest`/`verification`/`commitSha` are reserved for the later
+ * edit-execution milestone and are not populated or consumed yet.
+ */
+export interface HydraLiteTaskFields {
+  /** Immutable id of the Hydra Lite registry project this task belongs to. */
+  projectId?: string;
+  /** Whether Codex may only read (`-s read-only`) or may edit the project. */
+  effect?: 'read' | 'edit';
+  /** Deterministic Codex routing tier; edit tasks floor at 'balanced'. */
+  tier?: 'low' | 'balanced' | 'high';
+  approval?: TaskApproval;
+  /** Hydra Lite only: the runtime agent (`codex`|`claude`|`gemini`) active
+   * in the chat console when an edit task was queued via `/edit`. Set once,
+   * at creation, and never changed afterward — `/run` always executes the
+   * task under this agent, never whichever `/agent` happens to be active at
+   * run time, so switching agents never silently changes an already-queued
+   * task. Unset on legacy/read tasks, which fall back to `codex`. */
+  intendedAgent?: 'codex' | 'claude' | 'gemini';
+  verification?: { passed: boolean; command?: string; checkedAt: string };
+  /** Changed-file manifest staged by the (future) scoped commit step. */
+  manifest?: string[];
+  /** Incremented each time a crash/restart requeues this task. */
+  attempts?: number;
+  /** Local commit SHA produced by the (future) verify+commit step. */
+  commitSha?: string;
+  /** Relative scheduling priority within this task's project, for the
+   * worker's weighted round-robin pick order (lib/hydra-lite-worker.ts).
+   * Default 0 when unset. Purely advisory — never affects the concurrency
+   * gate or what a human can claim/run manually via the chat console. */
+  priority?: number;
+  /** Token/cost/duration usage recorded from the attempt that finished
+   * this task (done or blocked) — not summed across earlier retries of
+   * the same task. Stamped by lib/hydra-lite-run-edit.ts so the chat
+   * console's /usage command and background ticker (lib/hydra-lite-usage.ts)
+   * can total it straight off GET /state instead of keeping a separate
+   * log. Absent on read tasks and on any edit task that never finished an
+   * attempt. */
+  usage?: TaskUsage;
+}
+
+/** Normalized token/cost/duration usage for one CLI invocation — the
+ * common shape hydra-lite-codex-session.ts and hydra-lite-claude-session.ts
+ * both report, regardless of how differently each CLI's own JSON reports
+ * it (Codex has no dollar cost; Claude has no reasoning-token breakdown). */
+export interface TaskUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cachedInputTokens?: number;
+  costUsd?: number;
+  durationMs: number;
+}
 
 /** Shape of a task record as stored in daemon state.tasks[] */
-export interface TaskState {
+export interface TaskState extends HydraLiteTaskFields {
   id: string;
   title: string;
   owner: string;
@@ -805,6 +882,13 @@ export interface ReadRouteCtx {
   readArchive: () => ArchiveState;
   getMetricsSummary: () => Record<string, unknown>;
   getEventCount: () => number;
+  /**
+   * Hydra Lite registry project this request targets, resolved from the
+   * `?projectId=` query param. Undefined means "legacy single-project
+   * mode" (no behavior change from before the registry existed) — the
+   * daemon only applies registry-aware scoping/limits when this is set.
+   */
+  projectId?: string;
 }
 
 /** Context object passed to handleWriteRoute */
@@ -843,6 +927,14 @@ export interface WriteRouteCtx extends ReadRouteCtx {
   mergeTaskWorktree: (taskId: string) => Record<string, unknown>;
   cleanupTaskWorktree: (taskId: string) => void;
   writeStatus: (extra?: Record<string, unknown>) => void;
+  /**
+   * In-flight read/write load for every OTHER registered Hydra Lite
+   * project (excludes `projectId` itself) — used by the task/claim
+   * concurrency gate (lib/daemon/scheduler.ts's canClaim) to compute a
+   * global snapshot alongside the current project's own `state.tasks`.
+   * Only meaningful when `projectId` is set.
+   */
+  countOtherProjectsInFlight: () => Record<string, { reading: number; writing: boolean }>;
 }
 
 // ── Dispatch types ────────────────────────────────────────────────────────────

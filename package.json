@@ -1,10 +1,13 @@
 {
   "name": "hydra",
   "version": "1.2.0",
-  "description": "Multi-agent AI orchestration system",
+  "description": "Hydra Lite for macOS — a lean, Codex-only, terminal continuation of Hydra, the multi-agent AI orchestration system",
   "type": "module",
   "license": "MIT",
   "author": "Silly Pepper",
+  "contributors": [
+    "glodimendes (https://github.com/glodimendes) — creator/continuator of Hydra Lite for macOS"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/PrimeLocus/Hydra.git"
@@ -46,6 +49,9 @@
     "model": "node lib/orchestrator-client.ts model",
     "models": "node lib/hydra-models.ts",
     "models:select": "node lib/hydra-models-select.ts",
+    "project": "node lib/hydra-project-cli.ts",
+    "chat": "node lib/hydra-lite-chat.ts",
+    "worker": "node lib/hydra-lite-worker.ts",
     "setup": "node lib/hydra-setup.ts setup",
     "init": "node lib/hydra-setup.ts init",
     "init:daemon": "node lib/orchestrator-client.ts init",
@@ -83,7 +89,7 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "quality": "npm run lint && npm run format:check && npm run typecheck && npm run lint:cycles && npm --workspace @hydra/web run typecheck:workspace",
     "setup:hooks": "node scripts/setup-hooks.ts",
-    "test": "node --test --experimental-test-module-mocks 'test/**/*.test.ts' 'apps/**/src/**/*.test.ts' 'packages/**/src/**/*.test.ts' && npm --workspace @hydra/web run test:browser",
+    "test": "node --test --test-timeout=10000 --experimental-test-module-mocks 'test/**/*.test.ts' 'apps/**/src/**/*.test.ts' 'packages/**/src/**/*.test.ts' && npm --workspace @hydra/web run test:browser",
     "test:packaging": "node --test --experimental-test-module-mocks test/packaging.test.ts",
     "test:coverage": "c8 npm test",
     "test:coverage:check": "node_modules/.bin/c8 check-coverage",

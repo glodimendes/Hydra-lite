@@ -1,6 +1,7 @@
 node_modules/
 .idea/
 .claude/
+.agents
 docs/coordination/
 .env*
 !.env.example
@@ -11,6 +12,8 @@ nul
 dist/
 .worktrees/
 recent-projects.json
+registry.json
+.hydra/
 /docs/audit/
 /docs/coordination/
 #/docs/plans/

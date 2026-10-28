@@ -7,6 +7,8 @@
 
 > **Status:** Active development. APIs may change between releases.
 
+> **This branch — Hydra Lite for macOS:** a lean, Codex-only, terminal continuation of Hydra, built from and tracking the original project. Hydra was created by [Silly Pepper](https://github.com/PrimeLocus); Hydra Lite for macOS is created and continued by [glodimendes](https://github.com/glodimendes). See [docs/plan/hydra-lite-macos-plan.md](docs/plan/hydra-lite-macos-plan.md) for the authoritative plan and scope for this edition.
+
 ---
 
 ## Table of Contents

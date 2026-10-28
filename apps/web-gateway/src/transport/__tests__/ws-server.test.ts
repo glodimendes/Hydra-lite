@@ -49,8 +49,7 @@ async function waitForCloseOrError(ws: WebSocket): Promise<void> {
   });
 }
 
-async function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
-  const [data] = (await once(ws, 'message')) as [WebSocket.RawData];
+function parseWsMessage(data: WebSocket.RawData): Record<string, unknown> {
   let payload: Buffer | Uint8Array | string;
   if (typeof data === 'string') {
     payload = data;
@@ -64,6 +63,71 @@ async function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
 
   const text = typeof payload === 'string' ? payload : new TextDecoder().decode(payload);
   return JSON.parse(text) as Record<string, unknown>;
+}
+
+async function waitForMessage(ws: WebSocket): Promise<Record<string, unknown>> {
+  const [data] = (await once(ws, 'message')) as [WebSocket.RawData];
+  return parseWsMessage(data);
+}
+
+/**
+ * Consume messages from `ws` until one matches `predicate`, discarding any
+ * others along the way. Several connections in this suite also receive an
+ * asynchronous bootstrap message (`session-active`, `session-expiring-
+ * soon`, or `daemon-restored`) whose exact arrival time relative to a
+ * test's own trigger is a genuine race — not a test-environment timing
+ * issue, but a real ordering race in the production code between that
+ * bootstrap send and whatever the test does next (confirmed by reading
+ * session-ws-bridge.ts). Filtering past anything that isn't the message
+ * under test is the correct fix, not a longer wait.
+ */
+async function waitForMessageMatching(
+  ws: WebSocket,
+  predicate: (message: Record<string, unknown>) => boolean,
+  timeoutMs = 5000,
+): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(new Error('Timed out waiting for a matching websocket message'));
+    }, timeoutMs);
+
+    function onMessage(data: WebSocket.RawData) {
+      const message = parseWsMessage(data);
+      if (predicate(message)) {
+        clearTimeout(timer);
+        ws.off('message', onMessage);
+        resolve(message);
+      }
+    }
+
+    ws.on('message', onMessage);
+  });
+}
+
+/** Poll `read()` until it stops changing for `quietMs` consecutive
+ * milliseconds (an async promise chain has settled), rather than guessing a
+ * fixed grace period that may be too short under system load or longer
+ * than necessary otherwise. */
+async function waitForStable<T>(read: () => T, quietMs: number, timeoutMs = 5000): Promise<T> {
+  const startedAt = Date.now();
+  let lastValue = read();
+  let lastChangedAt = Date.now();
+  for (;;) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    const value = read();
+    if (value !== lastValue) {
+      lastValue = value;
+      lastChangedAt = Date.now();
+    } else if (Date.now() - lastChangedAt >= quietMs) {
+      return lastValue;
+    }
+    if (Date.now() - startedAt >= timeoutMs) {
+      return lastValue;
+    }
+  }
 }
 
 class FakeEventBridge {
@@ -145,20 +209,54 @@ async function waitForMessages(
   return await new Promise((resolve) => {
     const messages: Array<Record<string, unknown>> = [];
     const onMessage = (data: WebSocket.RawData) => {
-      let payload: Buffer | Uint8Array | string;
-      if (typeof data === 'string') {
-        payload = data;
-      } else if (Array.isArray(data)) {
-        payload = Buffer.concat(data);
-      } else if (data instanceof ArrayBuffer) {
-        payload = new Uint8Array(data);
-      } else {
-        payload = data;
-      }
-
-      const text = typeof payload === 'string' ? payload : new TextDecoder().decode(payload);
-      messages.push(JSON.parse(text) as Record<string, unknown>);
+      messages.push(parseWsMessage(data));
       if (messages.length === count) {
+        ws.off('message', onMessage);
+        resolve(messages);
+      }
+    };
+
+    ws.on('message', onMessage);
+  });
+}
+
+/** Session-bootstrap message types sent asynchronously on connect/recovery
+ * (session-ws-bridge.ts's #emitActiveBootstrap/#emitExpiringSoonBootstrap),
+ * independent of whatever a test does next — their exact arrival time
+ * relative to a test's own trigger is a genuine production-code race, not
+ * a test-environment timing issue. */
+const BOOTSTRAP_MESSAGE_TYPES = new Set(['session-active', 'daemon-restored']);
+
+/**
+ * Like waitForMessages, but silently drops any bootstrap-type message
+ * (see BOOTSTRAP_MESSAGE_TYPES) instead of letting it occupy one of the
+ * `count` slots — a test asserting on an exact small batch of messages
+ * (e.g. two 'subscribed' acks + one 'stream-event') must not have one of
+ * those slots stolen by an unrelated bootstrap send it never asked about.
+ */
+async function waitForMessagesIgnoringBootstrap(
+  ws: WebSocket,
+  count: number,
+  timeoutMs = 5000,
+): Promise<Array<Record<string, unknown>>> {
+  return new Promise((resolve, reject) => {
+    const messages: Array<Record<string, unknown>> = [];
+    const timer = setTimeout(() => {
+      ws.off('message', onMessage);
+      reject(
+        new Error(
+          `Timed out waiting for ${String(count)} messages; received ${String(messages.length)}`,
+        ),
+      );
+    }, timeoutMs);
+    const onMessage = (data: WebSocket.RawData) => {
+      const message = parseWsMessage(data);
+      if (BOOTSTRAP_MESSAGE_TYPES.has(message['type'] as string)) {
+        return;
+      }
+      messages.push(message);
+      if (messages.length === count) {
+        clearTimeout(timer);
         ws.off('message', onMessage);
         resolve(messages);
       }
@@ -333,7 +431,7 @@ describe('GatewayWsServer', () => {
 
     ws.send(JSON.stringify({ type: 'subscribe', conversationId: 'conv-1' }));
 
-    const message = await waitForMessage(ws);
+    const message = await waitForMessageMatching(ws, (m) => m['type'] === 'subscribed');
     assert.equal(message['type'], 'subscribed');
     assert.equal(message['conversationId'], 'conv-1');
     assert.equal(message['currentSeq'], 0);
@@ -356,7 +454,7 @@ describe('GatewayWsServer', () => {
 
     ws.send('x'.repeat(MAX_INBOUND_MESSAGE_BYTES + 1));
 
-    const msg = await waitForMessage(ws);
+    const msg = await waitForMessageMatching(ws, (m) => m['type'] === 'error');
     assert.equal(msg['type'], 'error');
     assert.equal(msg['ok'], false);
     assert.equal(msg['code'], 'WS_INVALID_MESSAGE');
@@ -421,7 +519,7 @@ describe('GatewayWsServer', () => {
         },
       });
 
-      const messages = await waitForMessages(ws, 2);
+      const messages = await waitForMessagesIgnoringBootstrap(ws, 2);
       assert.deepEqual(
         messages.map((message) => message['type']),
         ['subscribed', 'unsubscribed'],
@@ -493,7 +591,7 @@ describe('GatewayWsServer', () => {
         },
       });
 
-      const messages = await waitForMessages(ws, 3);
+      const messages = await waitForMessagesIgnoringBootstrap(ws, 3);
       assert.equal(messages.filter((message) => message['type'] === 'stream-event').length, 1);
       assert.equal(messages.filter((message) => message['type'] === 'subscribed').length, 2);
     } finally {
@@ -545,8 +643,7 @@ describe('GatewayWsServer', () => {
         ws.send(JSON.stringify({ type: 'subscribe', conversationId: 'conv-1' }));
       }
 
-      const message = await waitForMessage(ws);
-      assert.equal(message['type'], 'error');
+      const message = await waitForMessageMatching(ws, (m) => m['type'] === 'error');
       assert.equal(message['code'], 'WS_MESSAGE_QUEUE_OVERFLOW');
       assert.equal(message['category'], 'rate-limit');
       await waitForCloseOrError(ws);
@@ -631,6 +728,20 @@ describe('GatewayWsServer', () => {
 
       await waitForCloseOrError(ws);
 
+      // How many calls happened before the close is itself a race (whether
+      // the ws library delivers all 65 frames in one synchronous batch, or
+      // with event-loop turns between them, decides whether message #1's
+      // queued handler gets to start before the overflow check closes the
+      // connection out from under it) — 0 or 1 are both legitimate. What
+      // must never happen is a FURTHER call after this point, from one of
+      // the other 64 queued handlers draining once connection.isClosed is
+      // already true.
+      const openCallsAtClose = openCalls;
+      assert.ok(
+        openCallsAtClose <= 1,
+        `Expected at most 1 openConversation call before close, got ${openCallsAtClose}`,
+      );
+
       // Release the initially blocked daemon call and let all queued handlers drain.
       pendingOpen.resolve({
         data: {
@@ -648,15 +759,15 @@ describe('GatewayWsServer', () => {
         },
       });
 
-      // Allow microtask queue to flush so any queued handlers that would
-      // call openConversation have a chance to run.
-      await new Promise<void>((resolve) => {
-        setTimeout(resolve, 50);
-      });
+      // Allow the message-queue promise chain to drain fully so any queued
+      // handlers that would (incorrectly) call openConversation have a
+      // chance to run. This polls the chain's own observable progress
+      // (openCalls going quiet) rather than guessing a fixed grace period.
+      await waitForStable(() => openCalls, 200);
 
       assert.equal(
         openCalls,
-        1,
+        openCallsAtClose,
         'queued handlers must not call openConversation after overflow close',
       );
     } finally {
@@ -672,13 +783,13 @@ describe('GatewayWsServer', () => {
     openSockets.push(ws);
 
     ws.send(JSON.stringify({ type: 'subscribe', conversationId: 'conv-1' }));
-    const subscribed = await waitForMessage(ws);
+    const subscribed = await waitForMessageMatching(ws, (m) => m['type'] === 'subscribed');
     assert.equal(subscribed['type'], 'subscribed');
 
     const event = makeStreamEvent(3);
     streamEventBridge.emitStreamEvent('conv-1', event);
 
-    const forwarded = await waitForMessage(ws);
+    const forwarded = await waitForMessageMatching(ws, (m) => m['type'] === 'stream-event');
     assert.equal(forwarded['type'], 'stream-event');
     assert.equal(forwarded['conversationId'], 'conv-1');
     assert.deepEqual(forwarded['event'], event);
@@ -807,7 +918,7 @@ describe('GatewayWsServer', () => {
     clock.advance(50_001);
     await gw.sessionService.validate(session.id);
 
-    const message = await waitForMessage(ws);
+    const message = await waitForMessageMatching(ws, (m) => m['type'] === 'session-expiring-soon');
     assert.equal(message['type'], 'session-expiring-soon');
   });
 
@@ -834,7 +945,7 @@ describe('GatewayWsServer', () => {
 
     healthResult = false;
     await gw.heartbeat.tick();
-    const down = await waitForMessage(ws);
+    const down = await waitForMessageMatching(ws, (m) => m['type'] === 'daemon-unavailable');
     assert.equal(down['type'], 'daemon-unavailable');
 
     healthResult = true;
@@ -946,10 +1057,16 @@ describe('GatewayWsServer', () => {
       openSockets.push(ws);
 
       // Warning timer fires before hard expiry
-      const warning = await waitForMessage(ws);
+      const warning = await waitForMessageMatching(
+        ws,
+        (m) => m['type'] === 'session-expiring-soon',
+      );
       assert.equal(warning['type'], 'session-expiring-soon');
 
-      const termination = await waitForMessage(ws);
+      const termination = await waitForMessageMatching(
+        ws,
+        (m) => m['type'] === 'session-terminated',
+      );
       assert.equal(termination['type'], 'session-terminated');
       await once(ws, 'close');
       assert.equal(localGateway.connectionRegistry.getBySession(session.id).size, 0);
@@ -1038,7 +1155,10 @@ describe('GatewayWsServer', () => {
       openSockets.push(ws);
 
       // No explicit validate() call — warning fires purely from the scheduled timer
-      const message = await waitForMessage(ws);
+      const message = await waitForMessageMatching(
+        ws,
+        (m) => m['type'] === 'session-expiring-soon',
+      );
       assert.equal(message['type'], 'session-expiring-soon');
     } finally {
       localGateway.wsServer?.close();

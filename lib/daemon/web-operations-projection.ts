@@ -42,6 +42,8 @@ export const DAEMON_TO_WORK_ITEM_STATUS: Readonly<Record<TaskStatus, WorkItemSta
   done: 'completed',
   failed: 'failed',
   cancelled: 'cancelled',
+  // Hydra Lite's edit-approval gate: not yet actionable, same bucket as 'todo'.
+  awaiting_approval: 'waiting',
 };
 
 const TERMINAL_STATUSES: ReadonlySet<WorkItemStatus> = new Set([

@@ -36,6 +36,7 @@ import {
 } from './hydra-metrics.ts';
 import { resolveProject, HYDRA_ROOT, loadHydraConfig, getRecentProjects } from './hydra-config.ts';
 import { envFileExists } from './hydra-env.ts';
+import { HYDRA_LITE_COMMANDS } from './hydra-command-registry.ts';
 import {
   parseArgs,
   getPrompt,
@@ -1393,6 +1394,13 @@ const COMMAND_TABLE: { test: (l: string) => boolean; handler: CommandHandler }[]
   { test: (l) => l === ':pr' || l.startsWith(':pr '), handler: handlePrDispatch },
   { test: (l) => l === ':nightly' || l.startsWith(':nightly '), handler: handleNightlyDispatch },
   { test: (l) => l === ':evolve' || l.startsWith(':evolve '), handler: handleEvolveDispatch },
+  // Hydra Lite registry-derived commands (:project, :approve) — see
+  // lib/hydra-command-registry.ts, the single source of truth for both
+  // this dispatch and the help text generated in lib/hydra-operator-ui.ts.
+  ...HYDRA_LITE_COMMANDS.map((entry) => ({
+    test: entry.test,
+    handler: (ctx: LoopCtx, _state: LoopState, line: string) => entry.handler(ctx, line),
+  })),
 ];
 
 // ── Sidecar ───────────────────────────────────────────────────────────────────
